@@ -1,0 +1,23 @@
+{
+  "name": "claude-session-orchestrator",
+  "version": "0.2.0",
+  "description": "A board + chat room to orchestrate parallel Claude Code sessions on one repo: live worktrees, file claims, collision detection, safe cleanup, and hard guardrails that stop sessions from tangling each other's commits.",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "pz": "pz.js"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "git-worktree",
+    "orchestration",
+    "ai-agents"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

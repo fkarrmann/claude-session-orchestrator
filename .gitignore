@@ -1,0 +1,22 @@
+# Config per-machine (tiene la ruta absoluta del repo).
+# Copiá pz.config.example.json, o corré: node pz.js install <repo>
+pz.config.json
+
+# Secretos — NUNCA al repo (token del bot de Telegram + chatId).
+telegram.json
+
+# Estado de runtime: se regenera solo, contiene rutas/datos locales.
+sessions.json
+claims.json
+chat.json
+registry.json
+server.log
+
+# Backups + escrituras atómicas (tmp + rename) + backup de settings del installer.
+*.bak
+*.tmp
+*.pz-bak
+
+# Node / OS.
+node_modules/
+.DS_Store

@@ -1,0 +1,7 @@
+{
+  "repo": "/absolute/path/to/your/git/repo",
+  "mainBranch": "main",
+  "port": 4646,
+  "owner": "",
+  "envDirs": [""]
+}
