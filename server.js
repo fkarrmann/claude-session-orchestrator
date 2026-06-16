@@ -21,7 +21,7 @@ const MAIN_REPO = CONFIG.repo;        // repo cuyos worktrees se orquestan
 const MAIN_BRANCH = CONFIG.mainBranch;
 const PORT = CONFIG.port;             // PZ_PORT override para una instancia de prueba sin chocar la viva
 const REPO_NAME = CONFIG.repoName;    // basename — para detectar worktrees "named"
-const OWNER = CONFIG.owner;           // nombre del dueño: trigger "@owner" + firma de respuestas de Telegram
+let ownerName = CONFIG.owner;         // nombre del dueño: trigger "@owner" + firma de Telegram. EDITABLE en caliente desde el UI (POST /api/config) → se persiste a pz.config.json
 const escRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const REFRESH_MS = 8000;   // re-escaneo de git en background
 const REGISTRY = path.join(__dirname, 'registry.json'); // identidad por worktree (nombre+label) — legacy/fallback
@@ -246,9 +246,9 @@ function checkNotify() {
   try {
     const chat = readChat();
     if (!chat.length) return;
-    const ownerWord = OWNER ? new RegExp('\\b' + escRe(OWNER) + '\\b', 'i') : null;  // mención del owner
-    const ownerAt = OWNER ? new RegExp('@' + escRe(OWNER) + '\\b', 'i') : null;       // @owner (con arroba)
-    const ownerStart = OWNER ? new RegExp('^' + escRe(OWNER), 'i') : null;            // sus propios mensajes
+    const ownerWord = ownerName ? new RegExp('\\b' + escRe(ownerName) + '\\b', 'i') : null;  // mención del owner
+    const ownerAt = ownerName ? new RegExp('@' + escRe(ownerName) + '\\b', 'i') : null;       // @owner (con arroba)
+    const ownerStart = ownerName ? new RegExp('^' + escRe(ownerName), 'i') : null;            // sus propios mensajes
     // no hacer eco de lo que entró por Telegram (firmado "X (Telegram)") ni de los propios mensajes del owner
     const notMine = (m) => !/\(telegram\)\s*$/i.test(m.from || '') && !(ownerStart && ownerStart.test(m.from || ''));
     // Banner local (macOS): ask/warn, y mención del owner por su nombre (si está configurado)
@@ -326,7 +326,7 @@ async function tgHandle(u) {
     if (mm) {
       const verdict = mm[1] === 'a' ? '✅ Aceptar' : '❌ Cancelar';
       const asker = askerOf(mm[2]) || (tgSent[cq.message && cq.message.message_id] || {}).from;
-      const who = OWNER || (cq.from && cq.from.first_name) || 'Owner';
+      const who = ownerName || (cq.from && cq.from.first_name) || 'Owner';
       postMessage({ from: who + ' (Telegram)', type: 'note', text: '→ ' + (asker ? asker + ': ' : '') + verdict });
       if (cq.message) await tgApi('editMessageText', {
         chat_id: cq.message.chat.id, message_id: cq.message.message_id,
@@ -349,7 +349,7 @@ async function tgHandle(u) {
   if (fromLc !== adminLc) return;
   // respuesta escrita: si es reply a una pregunta puntual, la ruteo a ese asker
   const ref = msg.reply_to_message && tgSent[msg.reply_to_message.message_id];
-  const who = OWNER || (msg.from && msg.from.first_name) || 'Owner';
+  const who = ownerName || (msg.from && msg.from.first_name) || 'Owner';
   postMessage({ from: who + ' (Telegram)', type: 'note', text: (ref && ref.from ? '→ ' + ref.from + ': ' : '') + msg.text.slice(0, 900) });
   await tgApi('setMessageReaction', { chat_id: msg.chat.id, message_id: msg.message_id, reaction: [{ type: 'emoji', emoji: '👍' }] });
 }
@@ -385,6 +385,17 @@ function cleanWorktree(wtPath, branch) {
   return { ok: true };
 }
 
+// ─── Owner editable desde el UI ──────────────────────────────────────────────
+// Actualiza la variable viva (efecto inmediato) y la persiste a pz.config.json
+// (para sobrevivir reinicios). Cap de 40 chars; vacío = sin owner (válido).
+function setOwner(v) {
+  ownerName = String(v == null ? '' : v).trim().slice(0, 40);
+  const conf = readJSON(CONFIG.configPath, {});
+  conf.owner = ownerName;
+  writeJSONAtomic(CONFIG.configPath, conf);
+  return ownerName;
+}
+
 // ─── HTTP ────────────────────────────────────────────────────────────────────
 function body(req) { return new Promise((res) => { let b = ''; req.on('data', (c) => (b += c)); req.on('end', () => res(b)); }); }
 
@@ -405,8 +416,12 @@ const server = http.createServer(async (req, res) => {
 
   if (req.url.startsWith('/api/') && !sameOrigin(req)) return json(403, { ok: false, error: 'forbidden (cross-origin)' });
 
-  if (req.url === '/api/state') return json(200, { ...cache, chat: readChat() });
+  if (req.url === '/api/state') return json(200, { ...cache, owner: ownerName, chat: readChat() });
   if (req.url === '/api/chat') return json(200, { chat: readChat() });
+  if (req.url === '/api/config' && req.method === 'POST') {
+    let p = {}; try { p = JSON.parse(await body(req)); } catch {}
+    return json(200, { ok: true, owner: setOwner(p.owner) });
+  }
   if (req.url === '/api/say' && req.method === 'POST') {
     let p = {}; try { p = JSON.parse(await body(req)); } catch {}
     const r = postMessage(p); return json(r.ok ? 200 : 400, r);
@@ -460,6 +475,15 @@ const HTML = /* html */ `<!doctype html>
   .icon-btn{display:flex;align-items:center;justify-content:center;width:30px;height:30px;background:var(--pz-card);border:1px solid var(--pz-border);color:var(--pz-muted);border-radius:8px;cursor:pointer;transition:all .15s}
   .icon-btn:hover{border-color:var(--pz-accent);color:var(--pz-accent)}
   .updated{font-size:11px;color:var(--pz-muted);min-width:128px;text-align:right}
+  #ownerWrap{display:flex;align-items:center}
+  .owner-chip{display:flex;align-items:center;gap:6px;max-width:170px;background:var(--pz-card);border:1px solid var(--pz-border);color:var(--pz-muted);border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer;transition:all .15s}
+  .owner-chip:hover{border-color:var(--pz-accent);color:var(--pz-text)}
+  .owner-chip .ic{color:var(--pz-accent)}
+  .owner-chip b{color:var(--pz-text);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .owner-chip.unset{color:var(--pz-amber);border-color:rgba(240,136,62,.35)}
+  .owner-chip.unset .ic{color:var(--pz-amber)}
+  .owner-input{width:150px;background:var(--pz-card-in);border:1px solid rgba(var(--pz-accent-rgb),.5);color:var(--pz-text);border-radius:8px;padding:4px 9px;font-size:12px;font-family:inherit}
+  .owner-input:focus{outline:none}
 
   .danger-strip{flex:none;display:flex;align-items:center;gap:9px;padding:9px 18px;font-size:12.5px;
     background:rgba(248,81,73,.1);border-bottom:1px solid rgba(248,81,73,.35);color:#ff9d9d}
@@ -564,6 +588,7 @@ const HTML = /* html */ `<!doctype html>
 <header>
   <h1 id="brand"></h1>
   <div class="stats" id="stats"></div>
+  <span id="ownerWrap"></span>
   <button class="icon-btn" id="refreshBtn" title="Refrescar"></button>
   <div class="updated" id="updated"></div>
 </header>
@@ -626,6 +651,36 @@ function renderPresence(sessions){
   if(!names.length){el.style.display='none';el.innerHTML='';return;}
   el.style.display='flex';
   el.innerHTML='<span class="presence-lbl">'+ic('people')+'En la sala</span>'+names.map(chip).join('');
+}
+
+// ── Owner (tu nombre): editable inline desde el header ──
+let ownerCur='', editingOwner=false;
+function renderOwner(name){
+  if(editingOwner)return;            // no pisar el input mientras se edita
+  ownerCur=name||'';
+  const wrap=document.getElementById('ownerWrap');
+  wrap.innerHTML='<button class="owner-chip'+(ownerCur?'':' unset')+'" id="ownerBtn" title="Tu nombre — menciones @vos y firma de respuestas de Telegram">'+ic('people')+'<b>'+esc(ownerCur||'definí tu nombre')+'</b></button>';
+  document.getElementById('ownerBtn').addEventListener('click',openOwnerEdit);
+}
+function openOwnerEdit(){
+  editingOwner=true;
+  const wrap=document.getElementById('ownerWrap');
+  wrap.innerHTML='<input class="owner-input" id="ownerInput" maxlength="40" placeholder="tu nombre" />';
+  const inp=document.getElementById('ownerInput');
+  inp.value=ownerCur;inp.focus();inp.select();
+  let done=false;
+  const finish=async(save)=>{
+    if(done)return;done=true;
+    const v=inp.value.trim();
+    if(save&&v!==ownerCur){
+      try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({owner:v})});const d=await r.json();
+        if(d.ok){editingOwner=false;renderOwner(d.owner||'');toast('Tu nombre: '+(d.owner||'(vacío)'),'ok');return;}}catch{}
+      toast('No se pudo guardar','err');
+    }
+    editingOwner=false;renderOwner(ownerCur);
+  };
+  inp.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();finish(true);}else if(e.key==='Escape'){e.preventDefault();finish(false);}});
+  inp.addEventListener('blur',()=>finish(true));
 }
 function renderChat(chat){
   const log=document.getElementById('chatlog');
@@ -690,7 +745,7 @@ async function loadState(){
   const r=await fetch('/api/state');const d=await r.json();
   renderState(d);
   const rail2=document.getElementById('rail');if(rail2)rail2.scrollTop=ry;
-  renderPresence(d.sessions);renderChat(d.chat||[]);
+  renderPresence(d.sessions);renderOwner(d.owner||'');renderChat(d.chat||[]);
 }
 function renderState(d){
   const c=d.counts;
