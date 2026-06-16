@@ -451,69 +451,83 @@ if (cmd === 'isolate') {
 // Es lo que hace que la herramienta no llegue "muerta" a quien la clone: el motor
 // (frenos, presencia, inbox) vive en los hooks, no en esta carpeta.
 if (cmd === 'install' || cmd === 'uninstall') {
-  const os = require('os');
-  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
-  const node = process.execPath;   // el node con el que corre esto (Apple Silicon vs Intel, nvm, etc.)
-  const pzPath = __filename;        // este pz.js
-  const dry = rest.includes('--dry-run');
-  const q = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'"; // shell-quote para comillas simples
-  const command = (sub) => node + ' ' + q(pzPath) + ' ' + sub;
-  const SPECS = [
-    { event: 'SessionStart', sub: 'board --for-hook' },
-    { event: 'PreToolUse', matcher: 'Edit|Write|MultiEdit|NotebookEdit|Bash', sub: 'guard' },
-    { event: 'PostToolUse', sub: 'inbox' },
-    { event: 'UserPromptSubmit', sub: 'inbox' },
-    { event: 'SessionEnd', sub: 'leave' },
-  ];
+  (async () => {
+    const os = require('os');
+    const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+    const node = process.execPath;   // el node con el que corre esto (Apple Silicon vs Intel, nvm, etc.)
+    const pzPath = __filename;        // este pz.js
+    const dry = rest.includes('--dry-run');
+    const q = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'"; // shell-quote para comillas simples
+    const command = (sub) => node + ' ' + q(pzPath) + ' ' + sub;
+    const SPECS = [
+      { event: 'SessionStart', sub: 'board --for-hook' },
+      { event: 'PreToolUse', matcher: 'Edit|Write|MultiEdit|NotebookEdit|Bash', sub: 'guard' },
+      { event: 'PostToolUse', sub: 'inbox' },
+      { event: 'UserPromptSubmit', sub: 'inbox' },
+      { event: 'SessionEnd', sub: 'leave' },
+    ];
 
-  // install acepta la ruta del repo: pz install <repo>
-  if (cmd === 'install') {
-    const repoArg = rest.filter((r) => !r.startsWith('--'))[0];
-    if (repoArg) {
-      const abs = path.resolve(repoArg.startsWith('~') ? path.join(os.homedir(), repoArg.slice(1)) : repoArg);
-      if (!fs.existsSync(path.join(abs, '.git'))) console.log(`⚠️  ${abs} no parece un repo git (no encontré .git) — lo configuro igual.`);
-      const conf = readJSON(CFG.configPath, {});
-      conf.repo = abs; conf.mainBranch = conf.mainBranch || 'main'; conf.port = conf.port || 4646;
-      if (!dry) writeJSON(CFG.configPath, conf);
-      console.log(`${dry ? '[dry-run] ' : '✓ '}repo configurado: ${abs}  →  ${CFG.configPath}`);
-    } else if (!CFG.configured) {
-      console.error('Falta la ruta del repo. Uso: pz install <ruta-al-repo>'); process.exit(1);
-    }
-  }
-
-  // leer settings.json con cuidado: si existe pero no parsea, ABORTAR (no pisar la config del usuario)
-  let settings = {};
-  if (fs.existsSync(settingsPath)) {
-    try { settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); }
-    catch { console.error(`No pude parsear ${settingsPath} (¿JSON inválido?). Aborto para no pisarlo.`); process.exit(1); }
-  }
-  settings.hooks = settings.hooks || {};
-  const isMine = (entry) => JSON.stringify(entry).includes(pzPath); // nuestras entradas referencian este pz.js
-  for (const spec of SPECS) {
-    const kept = (settings.hooks[spec.event] || []).filter((e) => !isMine(e)); // idempotente: saca las nuestras viejas
+    // install acepta la ruta del repo y, opcional, --owner "Nombre" (o lo pregunta)
     if (cmd === 'install') {
-      const entry = { hooks: [{ type: 'command', command: command(spec.sub) }] };
-      if (spec.matcher) entry.matcher = spec.matcher;
-      kept.push(entry);
+      const oi = rest.indexOf('--owner');
+      const ownerArg = oi >= 0 ? rest[oi + 1] : null;                       // valor que sigue a --owner
+      const repoArg = rest.filter((r, i) => !r.startsWith('--') && !(oi >= 0 && i === oi + 1))[0];
+      if (repoArg) {
+        const abs = path.resolve(repoArg.startsWith('~') ? path.join(os.homedir(), repoArg.slice(1)) : repoArg);
+        if (!fs.existsSync(path.join(abs, '.git'))) console.log(`⚠️  ${abs} no parece un repo git (no encontré .git) — lo configuro igual.`);
+        const conf = readJSON(CFG.configPath, {});
+        conf.repo = abs; conf.mainBranch = conf.mainBranch || 'main'; conf.port = conf.port || 4646;
+        // owner: por flag, o preguntando (solo si es terminal interactiva y no estaba seteado)
+        if (ownerArg) conf.owner = ownerArg.trim();
+        else if (!conf.owner && !dry && process.stdin.isTTY) {
+          const rl = require('readline/promises').createInterface({ input: process.stdin, output: process.stdout });
+          const ans = (await rl.question('¿Tu nombre? (para menciones "@vos" y firmar las respuestas de Telegram; Enter para omitir): ')).trim();
+          rl.close();
+          if (ans) conf.owner = ans;
+        }
+        if (typeof conf.owner !== 'string') conf.owner = ''; // dejá el campo presente aunque vacío (descubrible)
+        if (!dry) writeJSON(CFG.configPath, conf);
+        console.log(`${dry ? '[dry-run] ' : '✓ '}repo configurado: ${abs}${conf.owner ? `  ·  owner: ${conf.owner}` : ''}  →  ${CFG.configPath}`);
+      } else if (!CFG.configured) {
+        console.error('Falta la ruta del repo. Uso: pz install <ruta-al-repo> [--owner "Nombre"]'); process.exit(1);
+      }
     }
-    if (kept.length) settings.hooks[spec.event] = kept; else delete settings.hooks[spec.event];
-  }
 
-  if (dry) {
-    console.log(`[dry-run] ${settingsPath} → hooks quedarían:`);
-    console.log(JSON.stringify({ hooks: settings.hooks }, null, 2));
+    // leer settings.json con cuidado: si existe pero no parsea, ABORTAR (no pisar la config del usuario)
+    let settings = {};
+    if (fs.existsSync(settingsPath)) {
+      try { settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8')); }
+      catch { console.error(`No pude parsear ${settingsPath} (¿JSON inválido?). Aborto para no pisarlo.`); process.exit(1); }
+    }
+    settings.hooks = settings.hooks || {};
+    const isMine = (entry) => JSON.stringify(entry).includes(pzPath); // nuestras entradas referencian este pz.js
+    for (const spec of SPECS) {
+      const kept = (settings.hooks[spec.event] || []).filter((e) => !isMine(e)); // idempotente: saca las nuestras viejas
+      if (cmd === 'install') {
+        const entry = { hooks: [{ type: 'command', command: command(spec.sub) }] };
+        if (spec.matcher) entry.matcher = spec.matcher;
+        kept.push(entry);
+      }
+      if (kept.length) settings.hooks[spec.event] = kept; else delete settings.hooks[spec.event];
+    }
+
+    if (dry) {
+      console.log(`[dry-run] ${settingsPath} → hooks quedarían:`);
+      console.log(JSON.stringify({ hooks: settings.hooks }, null, 2));
+      process.exit(0);
+    }
+    try { if (fs.existsSync(settingsPath)) fs.copyFileSync(settingsPath, settingsPath + '.pz-bak'); } catch {}
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    writeJSON(settingsPath, settings);
+    if (cmd === 'install') {
+      console.log(`✓ Hooks instalados en ${settingsPath}  (backup: settings.json.pz-bak)`);
+      console.log(`  Arrancá el tablero:  node ${q(CFG.serverScript)}   →  http://localhost:${CFG.port}`);
+    } else {
+      console.log(`✓ Hooks de PZ Sessions removidos de ${settingsPath}`);
+    }
     process.exit(0);
-  }
-  try { if (fs.existsSync(settingsPath)) fs.copyFileSync(settingsPath, settingsPath + '.pz-bak'); } catch {}
-  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-  writeJSON(settingsPath, settings);
-  if (cmd === 'install') {
-    console.log(`✓ Hooks instalados en ${settingsPath}  (backup: settings.json.pz-bak)`);
-    console.log(`  Arrancá el tablero:  node ${q(CFG.serverScript)}   →  http://localhost:${CFG.port}`);
-  } else {
-    console.log(`✓ Hooks de PZ Sessions removidos de ${settingsPath}`);
-  }
-  process.exit(0);
+  })().catch((e) => { console.error('install:', e && e.message); process.exit(1); });
+  return; // el resto del archivo es sincrónico; cortamos acá para dejar correr el IIFE async
 }
 
 if (cmd === 'whoami') {
@@ -605,5 +619,5 @@ console.log(`pz — Sala de Sesiones${REPO_NAME ? ' · ' + REPO_NAME : ' (sin re
   pz isolate [<slug>] [--carry]         crear tu worktree propio off main y mudarte (lleva .env y node_modules)
   pz board                              ver otras sesiones + chat
   pz whoami
-  pz install [<ruta-al-repo>] [--dry-run]   configurar el repo + cablear los hooks en ~/.claude/settings.json
+  pz install [<ruta-al-repo>] [--owner "Nombre"] [--dry-run]   configurar repo (+ pregunta tu nombre) y cablear los hooks
   pz uninstall [--dry-run]              quitar los hooks de PZ Sessions`);

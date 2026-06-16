@@ -56,12 +56,14 @@ cd claude-session-orchestrator
 
 # 1. Point it at the repo you want to orchestrate, and wire the hooks:
 node pz.js install /absolute/path/to/your/repo        # add --dry-run to preview
+# (it asks for your name interactively; or pass it: --owner "Your Name")
 
 # 2. Start the board (keep it running; a process manager or launchd works well):
 node server.js        # → http://localhost:4646
 ```
 
-`pz install` does two things: writes `pz.config.json` (your repo path) and merges
+`pz install` does two things: writes `pz.config.json` (your repo path, and your
+name — it prompts, or pass `--owner "Name"`) and merges
 **5 hooks** into `~/.claude/settings.json`, using *this machine's* `node` binary
 and `pz.js` path. It backs up your settings first (`settings.json.pz-bak`), is
 idempotent (re-running just refreshes its own entries), and never touches other
