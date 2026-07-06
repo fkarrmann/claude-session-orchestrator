@@ -195,6 +195,29 @@ function gitBackup(message) {
   catch (e) { return { pushError: (e && e.message) || 'push falló (¿sin conexión?)' }; }
 }
 
+// ─── sección determinista: salud de worktrees ──────────────────────────────────
+// NO la redacta la IA: los números tienen que ser exactos. Se apendea al final
+// del diario. Muestra rojos/amarillos con su atraso; los verdes, solo el conteo.
+function worktreeHealthSection() {
+  let rows = [];
+  try { rows = require('./staleness').surveyAll(); } catch { return ''; }
+  if (!rows.length) return '';
+  const bad = rows.filter((r) => r.level);
+  const green = rows.length - bad.length;
+  const lines = ['', '## 🧭 Salud de worktrees', ''];
+  if (!bad.length) {
+    lines.push(`Todos al día: ${green} worktree${green === 1 ? '' : 's'} sin atraso relevante contra prod. ✅`);
+  } else {
+    lines.push('Atrasados contra prod (origin/main) — un worktree viejo hace que una sesión saque conclusiones de código fósil:', '');
+    for (const r of bad) {
+      const dot = r.level === 'red' ? '🔴' : '🟡';
+      lines.push(`- ${dot} **${r.name}** [${r.branch || 'detached'}] — ${r.behind} commits atrás · último commit hace ${r.ageDays}d`);
+    }
+    lines.push('', `(${green} worktree${green === 1 ? '' : 's'} al día. Rescate: \`pz isolate\` para trabajo nuevo; los museos se actualizan con \`git merge origin/main\` o se podan.)`);
+  }
+  return lines.join('\n');
+}
+
 // claude headless: prompt por stdin, markdown por stdout. Sin permisos de tools.
 function callClaude(prompt) {
   try {
@@ -220,7 +243,7 @@ function generate(opts = {}) {
 
   fs.mkdirSync(OUT_DIR, { recursive: true });
   const outPath = path.join(OUT_DIR, `${dateStr}.md`);
-  fs.writeFileSync(outPath, linkifyPRs(r.md, data.prs) + '\n');
+  fs.writeFileSync(outPath, linkifyPRs(r.md, data.prs) + worktreeHealthSection() + '\n');
   const backup = gitBackup(`Bitácora ${dateStr}`);
   return { path: outPath, date: dateStr, prCount: data.prs.length, sessionCount: data.sessions.length, backup, data };
 }
@@ -299,7 +322,7 @@ function generateWeekly(opts = {}) {
   return { path: outPath, weekEnd: win.weekEnd, label: win.label, prCount: data.prs.length, sessionCount: data.sessions.length, backup, data };
 }
 
-module.exports = { collect, collectWeek, generate, generateWeekly, buildPrompt, buildWeeklyPrompt, linkifyPRs, gitBackup, workdayWindow, weekWindowContaining, currentWorkday, OUT_DIR };
+module.exports = { collect, collectWeek, generate, generateWeekly, buildPrompt, buildWeeklyPrompt, linkifyPRs, gitBackup, workdayWindow, weekWindowContaining, currentWorkday, worktreeHealthSection, OUT_DIR };
 
 // directo: `node bitacora.js [--date D] [--json] [--weekly] [--last-week]`
 if (require.main === module) {

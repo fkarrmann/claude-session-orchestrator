@@ -581,6 +581,22 @@ if (cmd === 'board') {
     out.push('');
   }
 
+  // 🦴 ¿Este worktree es un museo? Avisar ANTES de que la sesión saque conclusiones
+  // de código fósil (fetch condicional adentro; fail-open si no hay red/remoto).
+  const stale = require('./staleness').measure(c.top, { fetch: true });
+  if (stale && stale.level) {
+    const offline = stale.fetchFailed ? ' (no pude contactar GitHub — comparo contra la última copia local de prod)' : '';
+    if (stale.level === 'red') {
+      out.push(`⛔ WORKTREE-MUSEO: estás ${stale.behind} commits detrás de prod (origin/${MAIN_BRANCH}); el último commit de acá es de hace ${stale.ageDays} días${offline}.`);
+      out.push('   Lo que ves en este directorio NO es el código de producción — no saques conclusiones ni edites sin actualizar.');
+      out.push('   → Trabajo nuevo: node "' + PZ_SCRIPT + '" isolate <tarea>   (nace fresco de prod)');
+      out.push('   → ¿Necesitás ESTE worktree sí o sí?: git fetch origin && git merge origin/' + MAIN_BRANCH);
+    } else {
+      out.push(`⚠️  Este worktree está ${stale.behind} commits / ${stale.ageDays} días detrás de prod (origin/${MAIN_BRANCH})${offline} — si vas a editar, primero actualizalo (git merge origin/${MAIN_BRANCH}) o aislate fresco (pz isolate).`);
+    }
+    out.push('');
+  }
+
   if (!state) { if (!forHook) console.log(out.concat('(PZ Sessions no está corriendo en :' + CFG.port + ')').join('\n')); else if (out.length) console.log(out.join('\n')); process.exit(0); }
 
   const active = state.sessions.filter((s) => s.isActive && s.path !== c.top);

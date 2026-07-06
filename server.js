@@ -23,6 +23,7 @@ const PORT = CONFIG.port;             // PZ_PORT override para una instancia de 
 const REPO_NAME = CONFIG.repoName;    // basename — para detectar worktrees "named"
 let ownerName = CONFIG.owner;         // nombre del dueño: trigger "@owner" + firma de Telegram. EDITABLE en caliente desde el UI (POST /api/config) → se persiste a pz.config.json
 const BITACORA = require('./bitacora'); // generador de la bitácora diaria (2 capas) — comparte OUT_DIR con pz.js
+const STALENESS = require('./staleness'); // medición worktree-vs-prod compartida (banner, tablero, bitácora)
 const BIT_DIR = BITACORA.OUT_DIR;     // carpeta de las bitácoras (.md) en el vault de Obsidian
 const PZ_SCRIPT = CONFIG.pzScript;    // ruta a pz.js — para disparar la generación async
 let bitGenerating = false;            // candado: una generación a la vez (evita solaparse)
@@ -99,6 +100,9 @@ function resolveBaseRef() {
 }
 
 function gather() {
+  // fetch condicional (TTL 30min) para que behind/staleLevel no mientan contra una
+  // copia local vieja de origin/main — casi siempre es un stat de FETCH_HEAD y nada más
+  STALENESS.ensureFreshBase(MAIN_REPO);
   resolveBaseRef();
   const registry = readJSON(REGISTRY, {});
   const liveSessions = Object.values(readLiveSessions());
@@ -159,6 +163,8 @@ function gather() {
     return {
       path: cwd, name: path.basename(cwd), kind, branch, detached: w.detached, exists,
       dirtyCount: dirtyFiles.length, stagedCount, ahead, behind, lastSubject, lastRel, lastIso, upstreamGone,
+      // museo-metro: rojo/amarillo si el worktree quedó lejos de prod (umbral compartido en staleness.js)
+      staleLevel: exists ? STALENESS.levelOf(behind, ageDays) : null, staleAgeDays: Math.floor(ageDays),
       pr: pr ? { number: pr.number, state: pr.state, url: pr.url, draft: pr.isDraft } : null,
       isMerged, isActive, cleanable, touched,
       sessionName, label,
@@ -814,6 +820,8 @@ function sessionRow(s){
   pills.push(s.dirtyCount>0?pill(s.dirtyCount+' sin guardar','amber'):pill('limpio','dim'));
   if(s.stagedCount>0)pills.push(pill(s.stagedCount+' en cola','amber'));
   if(s.ahead>0)pills.push(pill('+'+s.ahead+' vs main','blue'));
+  if(s.staleLevel==='red')pills.push(pill('museo: '+s.behind+' atrás · '+s.staleAgeDays+'d','red'));
+  else if(s.staleLevel==='yellow')pills.push(pill(s.behind+' atrás de prod','amber'));
   if(s.isMerged)pills.push(pill('mergeado','purple'));
   if(s.upstreamGone)pills.push(pill('remoto borrado','red'));
   pills.push(prPill(s.pr));
