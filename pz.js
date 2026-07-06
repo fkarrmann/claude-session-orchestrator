@@ -530,6 +530,23 @@ if (cmd === 'install' || cmd === 'uninstall') {
   return; // el resto del archivo es sincrónico; cortamos acá para dejar correr el IIFE async
 }
 
+if (cmd === 'bitacora') {
+  const bit = require('./bitacora');
+  const date = rest.includes('--date') ? rest[rest.indexOf('--date') + 1] : null;
+  const weekly = rest.includes('--weekly') || rest.includes('--last-week');
+  const lastWeek = rest.includes('--last-week');
+  const run = (jsonOnly) => weekly ? bit.generateWeekly({ date, jsonOnly, lastWeek }) : bit.generate({ date, jsonOnly });
+  if (rest.includes('--json')) { console.log(JSON.stringify(run(true).data, null, 2)); process.exit(0); }
+  console.log(`📖 Generando bitácora ${weekly ? 'SEMANAL' : (date ? `de ${date}` : 'de hoy')}… (la IA redacta, puede tardar un par de minutos)`);
+  const r = run(false);
+  if (r.empty) { console.log(`Sin actividad ${weekly ? 'esa semana' : 'ese día'} — no se generó bitácora.`); process.exit(0); }
+  if (r.error) { console.error('✗ ' + r.error); process.exit(1); }
+  console.log(weekly
+    ? `✓ Bitácora semanal ${r.label}: ${r.prCount} PRs, ${r.sessionCount} sesiones → ${r.path}`
+    : `✓ Bitácora ${r.date}: ${r.prCount} PRs, ${r.sessionCount} sesiones → ${r.path}`);
+  process.exit(0);
+}
+
 if (cmd === 'whoami') {
   const c = ctx({});
   const s = readJSON(SESSIONS, {})[c.sid];
@@ -618,6 +635,7 @@ console.log(`pz — Sala de Sesiones${REPO_NAME ? ' · ' + REPO_NAME : ' (sin re
   pz release [archivos...]              soltarlos
   pz isolate [<slug>] [--carry]         crear tu worktree propio off main y mudarte (lleva .env y node_modules)
   pz board                              ver otras sesiones + chat
+  pz bitacora [--date D] [--weekly] [--json]   generar bitácora diaria o semanal (2 capas) → Obsidian + tablero
   pz whoami
   pz install [<ruta-al-repo>] [--owner "Nombre"] [--dry-run]   configurar repo (+ pregunta tu nombre) y cablear los hooks
   pz uninstall [--dry-run]              quitar los hooks de PZ Sessions`);

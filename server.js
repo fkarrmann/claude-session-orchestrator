@@ -10,7 +10,7 @@
  */
 
 const http = require('http');
-const { execSync } = require('child_process');
+const { execSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -22,6 +22,10 @@ const MAIN_BRANCH = CONFIG.mainBranch;
 const PORT = CONFIG.port;             // PZ_PORT override para una instancia de prueba sin chocar la viva
 const REPO_NAME = CONFIG.repoName;    // basename — para detectar worktrees "named"
 let ownerName = CONFIG.owner;         // nombre del dueño: trigger "@owner" + firma de Telegram. EDITABLE en caliente desde el UI (POST /api/config) → se persiste a pz.config.json
+const BITACORA = require('./bitacora'); // generador de la bitácora diaria (2 capas) — comparte OUT_DIR con pz.js
+const BIT_DIR = BITACORA.OUT_DIR;     // carpeta de las bitácoras (.md) en el vault de Obsidian
+const PZ_SCRIPT = CONFIG.pzScript;    // ruta a pz.js — para disparar la generación async
+let bitGenerating = false;            // candado: una generación a la vez (evita solaparse)
 const escRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const REFRESH_MS = 8000;   // re-escaneo de git en background
 const REGISTRY = path.join(__dirname, 'registry.json'); // identidad por worktree (nombre+label) — legacy/fallback
@@ -431,6 +435,38 @@ const server = http.createServer(async (req, res) => {
     const r = cleanWorktree(p.path, p.branch); return json(r.ok ? 200 : 400, r);
   }
   if (req.url === '/api/refresh' && req.method === 'POST') { refresh(); return json(200, { ok: true }); }
+
+  // ─── Bitácora: listar fechas, leer una, generar (async) ───────────────────
+  if (req.url.startsWith('/api/bitacora')) {
+    const u = new URL(req.url, 'http://localhost');
+    const week = u.searchParams.get('kind') === 'week';
+    // diaria: "2026-07-02.md" → "2026-07-02"  ·  semanal: "Semana-2026-07-05.md" → "2026-07-05"
+    const listDates = (w) => { try { return fs.readdirSync(BIT_DIR)
+      .filter((f) => (w ? /^Semana-\d{4}-\d{2}-\d{2}\.md$/ : /^\d{4}-\d{2}-\d{2}\.md$/).test(f))
+      .map((f) => f.replace(/^Semana-/, '').slice(0, 10)).sort(); } catch { return []; } };
+    const fileFor = (w, d) => path.join(BIT_DIR, (w ? 'Semana-' : '') + d + '.md');
+    if (u.pathname === '/api/bitacora/list') return json(200, { dates: listDates(week).reverse(), generating: bitGenerating });
+    if (u.pathname === '/api/bitacora/generate' && req.method === 'POST') {
+      let p = {}; try { p = JSON.parse(await body(req)); } catch {}
+      if (bitGenerating) return json(200, { ok: true, already: true });
+      bitGenerating = true;
+      const args = [PZ_SCRIPT, 'bitacora'];
+      if (p.weekly) args.push('--weekly');
+      if (p.date) args.push('--date', String(p.date));
+      const child = spawn('node', args, { stdio: 'ignore' });
+      const clear = () => { bitGenerating = false; };
+      child.on('exit', clear); child.on('error', clear);
+      return json(200, { ok: true, started: true });
+    }
+    if (u.pathname === '/api/bitacora') {
+      const dates = listDates(week);
+      const date = u.searchParams.get('date') || (dates.length ? dates[dates.length - 1] : null);
+      if (!date) return json(200, { date: null, md: null, dates, generating: bitGenerating });
+      let md = null; try { md = fs.readFileSync(fileFor(week, date), 'utf8'); } catch {}
+      return json(200, { date, md, dates, generating: bitGenerating });
+    }
+  }
+
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(HTML);
 });
@@ -583,12 +619,42 @@ const HTML = /* html */ `<!doctype html>
     .chat{min-height:52vh}
     .msg{max-width:none}
   }
+  /* ── Bitácora: overlay + documento de 2 capas ── */
+  .bit-overlay{position:fixed;inset:0;background:rgba(3,5,8,.72);backdrop-filter:blur(3px);z-index:100;display:none;align-items:flex-start;justify-content:center;padding:38px 16px}
+  .bit-overlay.on{display:flex}
+  .bit-modal{width:min(860px,100%);max-height:calc(100vh - 76px);display:flex;flex-direction:column;background:var(--pz-card);border:1px solid var(--pz-border-h);border-radius:14px;box-shadow:0 24px 80px rgba(0,0,0,.6);overflow:hidden}
+  .bit-head{flex:none;display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--pz-border);background:var(--pz-card-in)}
+  .bit-head b{font-size:15px;color:var(--pz-text)}
+  .bit-title .ic{color:var(--pz-purple)}
+  #bitDate{background:var(--pz-body);color:var(--pz-text);border:1px solid var(--pz-border);border-radius:7px;padding:4px 8px;font-size:12px;font-family:var(--mono)}
+  .bit-tabs{display:flex;gap:2px;background:var(--pz-body);border:1px solid var(--pz-border);border-radius:8px;padding:2px}
+  .bit-tab{background:transparent;color:var(--pz-muted);border:0;border-radius:6px;padding:3px 11px;font-size:12px;cursor:pointer;font-weight:600}
+  .bit-tab.on{background:var(--pz-card);color:var(--pz-text)}
+  .bit-gen{background:rgba(var(--pz-accent-rgb),.14);color:var(--pz-accent);border:1px solid rgba(var(--pz-accent-rgb),.4);border-radius:7px;padding:4px 12px;font-size:12px;cursor:pointer;font-weight:600}
+  .bit-gen:hover{background:rgba(var(--pz-accent-rgb),.24)}
+  .bit-gen:disabled{opacity:.5;cursor:default}
+  .bit-spin{font-size:12px;color:var(--pz-amber);animation:bitpulse 1.2s ease-in-out infinite}
+  @keyframes bitpulse{0%,100%{opacity:.5}50%{opacity:1}}
+  .bit-body{overflow-y:auto;padding:22px 30px 34px;line-height:1.6;color:var(--pz-text);font-size:14px}
+  .bit-body h1{font-size:22px;margin:.2em 0 .6em;padding-bottom:.3em;border-bottom:1px solid var(--pz-border)}
+  .bit-body h2{font-size:18px;margin:1.3em 0 .5em;color:var(--pz-text)}
+  .bit-body h3{font-size:15px;margin:1.1em 0 .35em;color:var(--pz-purple)}
+  .bit-body ul{margin:.35em 0 .8em;padding-left:1.25em}
+  .bit-body li{margin:.2em 0}
+  .bit-body p{margin:.5em 0}
+  .bit-body a{color:var(--pz-accent);text-decoration:none}
+  .bit-body a:hover{text-decoration:underline}
+  .bit-body code{font-family:var(--mono);font-size:12.5px;background:var(--pz-card-in);border:1px solid var(--pz-border);border-radius:5px;padding:1px 5px;color:var(--pz-teal)}
+  .bit-body hr{border:0;border-top:1px solid var(--pz-border);margin:1.4em 0}
+  .bit-fm{font-family:var(--mono);font-size:11px;color:var(--pz-muted);background:var(--pz-card-in);border:1px solid var(--pz-border);border-radius:8px;padding:8px 12px;margin-bottom:14px;white-space:pre-wrap}
+  .bit-empty{color:var(--pz-muted);text-align:center;padding:50px 20px}
 </style></head>
 <body>
 <header>
   <h1 id="brand"></h1>
   <div class="stats" id="stats"></div>
   <span id="ownerWrap"></span>
+  <button class="icon-btn" id="bitBtn" title="Bitácora — el diario de a bordo del proyecto"></button>
   <button class="icon-btn" id="refreshBtn" title="Refrescar"></button>
   <div class="updated" id="updated"></div>
 </header>
@@ -618,6 +684,25 @@ const HTML = /* html */ `<!doctype html>
 </div>
 <div class="toast" id="toast"></div>
 
+<div class="bit-overlay" id="bitOverlay">
+  <div class="bit-modal">
+    <div class="bit-head">
+      <span class="bit-title" id="bitIcon"></span>
+      <b>Bitácora</b>
+      <div class="bit-tabs">
+        <button class="bit-tab on" id="bitTabDay">Diaria</button>
+        <button class="bit-tab" id="bitTabWeek">Semanal</button>
+      </div>
+      <select id="bitDate" title="Elegí el período"></select>
+      <button class="bit-gen" id="bitGen" title="Generar / regenerar el período elegido">generar</button>
+      <span class="bit-spin" id="bitSpin" style="display:none">redactando…</span>
+      <span style="flex:1"></span>
+      <button class="icon-btn" id="bitClose" title="Cerrar"></button>
+    </div>
+    <div class="bit-body" id="bitBody"></div>
+  </div>
+</div>
+
 <script>
 const esc=(s)=>(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 // chip de color ESTABLE derivado del nombre — la identidad de cada sesión
@@ -639,6 +724,8 @@ const ICON={
   send:'<path d="M15.854.146a.5.5 0 0 1 .11.54l-5.819 14.547a.75.75 0 0 1-1.329.124l-3.178-4.995L.643 7.184a.75.75 0 0 1 .124-1.33L15.314.037a.5.5 0 0 1 .54.11ZM6.636 10.07l2.761 4.338L14.13 2.576zm6.787-8.201L1.591 6.602l4.339 2.76z"/>',
   people:'<path d="M15 14s1 0 1-1-1-4-5-4-5 3-5 4 1 1 1 1zm-7.978-1A.13.13 0 0 1 7 13h4.99q.01-.452-.32-1.005a4.5 4.5 0 0 0-1.166-1.249C9.879 10.219 9.05 10 8 10c-1.99 0-3 1.5-3 2.5 0 .456.291.81.32.5zM11 6a3 3 0 1 1-6 0 3 3 0 0 1 6 0"/>',
   broom:'<path d="M6.5 1h3a.5.5 0 0 1 .5.5v1H6v-1a.5.5 0 0 1 .5-.5M11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3A1.5 1.5 0 0 0 5 1.5v1H1.5a.5.5 0 0 0 0 1h.538l.853 10.66A2 2 0 0 0 4.885 16h6.23a2 2 0 0 0 1.994-1.84l.853-10.66h.538a.5.5 0 0 0 0-1zm1.958 1-.846 10.58a1 1 0 0 1-.997.92h-6.23a1 1 0 0 1-.997-.92L3.042 3.5z"/>',
+  book:'<path d="M1 2.828c.885-.37 2.154-.769 3.388-.893 1.33-.134 2.458.063 3.112.752v9.746c-.935-.53-2.12-.603-3.213-.493-1.18.12-2.37.461-3.287.811zm7.5-.141c.654-.689 1.782-.886 3.112-.752 1.234.124 2.503.523 3.388.893v9.923c-.918-.35-2.107-.692-3.287-.81-1.094-.111-2.278-.039-3.213.492zM8 1.783C7.015.936 5.587.81 4.287.94c-1.514.153-3.042.672-3.994 1.105A.5.5 0 0 0 0 2.5v11a.5.5 0 0 0 .707.455c.882-.4 2.303-.881 3.68-1.02 1.409-.142 2.59.087 3.223.877a.5.5 0 0 0 .78 0c.633-.79 1.814-1.019 3.222-.877 1.378.139 2.8.62 3.681 1.02A.5.5 0 0 0 16 13.5v-11a.5.5 0 0 0-.293-.455c-.952-.433-2.48-.952-3.994-1.105C10.413.809 8.985.936 8 1.783"/>',
+  x:'<path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708"/>',
 };
 const ic=(n,cls,sz)=>'<svg class="ic'+(cls?' '+cls:'')+'" width="'+(sz||14)+'" height="'+(sz||14)+'" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">'+(ICON[n]||'')+'</svg>';
 const pill=(t,k)=>'<span class="pill'+(k?' '+k:'')+'">'+esc(String(t))+'</span>';
@@ -785,11 +872,80 @@ async function cleanIt(p){if(!confirm('¿Limpiar "'+p.name+'"?\\nQuita el worktr
 async function hardRefresh(){await fetch('/api/refresh',{method:'POST'});setTimeout(loadState,400);}
 let tT;function toast(m,k){const t=document.getElementById('toast');t.textContent=m;t.className='toast show '+(k||'');clearTimeout(tT);tT=setTimeout(()=>t.className='toast',2500);}
 
+// ── Bitácora: visor del diario de a bordo (markdown de 2 capas) ──
+function mdInline(s){s=esc(s);
+  s=s.replace(/\`([^\`]+)\`/g,(m,c)=>'<code>'+c+'</code>');
+  s=s.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g,(m,t,u)=>'<a href="'+u+'" target="_blank" rel="noopener">'+t+'</a>');
+  s=s.replace(/\\*\\*([^*]+)\\*\\*/g,'<b>$1</b>');
+  return s;}
+function mdToHtml(md){
+  const lines=(md||'').split('\\n');let out=[],i=0,inList=false,fm=null,m;
+  if(lines[0]&&lines[0].trim()==='---'){let j=1,buf=[];while(j<lines.length&&lines[j].trim()!=='---'){buf.push(lines[j]);j++;}fm=buf.join('\\n').trim();i=j+1;}
+  const closeList=()=>{if(inList){out.push('</ul>');inList=false;}};
+  for(;i<lines.length;i++){const ln=lines[i],t=ln.trim();
+    if(!t){closeList();continue;}
+    if(t==='---'){closeList();out.push('<hr>');continue;}
+    if(m=t.match(/^(#{1,6})\\s+(.*)$/)){closeList();const lv=m[1].length;out.push('<h'+lv+'>'+mdInline(m[2])+'</h'+lv+'>');continue;}
+    if(m=ln.match(/^(\\s*)[-*]\\s+(.*)$/)){if(!inList){out.push('<ul>');inList=true;}const nest=m[1].length>=2?' style="margin-left:1.1em;list-style:circle"':'';out.push('<li'+nest+'>'+mdInline(m[2])+'</li>');continue;}
+    closeList();out.push('<p>'+mdInline(t)+'</p>');}
+  closeList();
+  return (fm?'<div class="bit-fm">'+esc(fm)+'</div>':'')+out.join('');}
+const bp2=(n)=>String(n).padStart(2,'0');
+const bitMES=['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
+function bitToday(){const d=new Date(Date.now()-5*3600*1000);return d.getFullYear()+'-'+bp2(d.getMonth()+1)+'-'+bp2(d.getDate());}
+function bitWeekEnd(iso){const b=iso?new Date(iso+'T12:00:00'):new Date(Date.now()-5*3600*1000);const dow=(b.getDay()+6)%7;
+  const s=new Date(b.getFullYear(),b.getMonth(),b.getDate()-dow+6);return s.getFullYear()+'-'+bp2(s.getMonth()+1)+'-'+bp2(s.getDate());}
+function weekLabel(sunISO){const s=new Date(sunISO+'T12:00:00');const mo=new Date(s.getFullYear(),s.getMonth(),s.getDate()-6);
+  return mo.getDate()+'-'+bitMES[mo.getMonth()]+' al '+s.getDate()+'-'+bitMES[s.getMonth()];}
+let bitKind='day',bitPollT=null;
+const bitKq=()=>bitKind==='week'?'week':'day';
+function openBitacora(){document.getElementById('bitOverlay').classList.add('on');loadBitList();}
+function closeBitacora(){document.getElementById('bitOverlay').classList.remove('on');if(bitPollT){clearInterval(bitPollT);bitPollT=null;}}
+function setBitKind(k){if(k===bitKind)return;bitKind=k;
+  document.getElementById('bitTabDay').classList.toggle('on',k==='day');
+  document.getElementById('bitTabWeek').classList.toggle('on',k==='week');
+  loadBitList();}
+async function loadBitList(sel){
+  const d=await (await fetch('/api/bitacora/list?kind='+bitKq())).json();
+  const dates=(d.dates||[]).slice();const cur=bitKind==='week'?bitWeekEnd():bitToday();
+  if(!dates.includes(cur))dates.unshift(cur);
+  const sd=document.getElementById('bitDate');
+  sd.innerHTML=dates.map(x=>{const lbl=bitKind==='week'?weekLabel(x):x;const tag=x===cur?(bitKind==='week'?' (esta semana)':' (hoy)'):'';
+    return '<option value="'+x+'">'+lbl+tag+'</option>';}).join('');
+  sd.value=(sel&&dates.includes(sel))?sel:dates[0];
+  await loadBit(sd.value);
+  setBitGenerating(d.generating);}
+async function loadBit(date){const body=document.getElementById('bitBody');
+  if(!date){body.innerHTML='<div class="bit-empty">Elegí un período.</div>';return;}
+  const d=await (await fetch('/api/bitacora?kind='+bitKq()+'&date='+encodeURIComponent(date))).json();
+  const per=bitKind==='week'?'de la semana <b>'+esc(weekLabel(date))+'</b>':'de <b>'+esc(date)+'</b>';
+  body.innerHTML=d.md?mdToHtml(d.md):'<div class="bit-empty">Todavía no hay bitácora '+per+'.<br>Apretá <b>generar</b> para crearla.</div>';
+  body.scrollTop=0;}
+function setBitGenerating(on){document.getElementById('bitGen').disabled=!!on;document.getElementById('bitSpin').style.display=on?'inline':'none';
+  if(on&&!bitPollT)bitPollT=setInterval(pollBitDone,4000);}
+async function pollBitDone(){const d=await (await fetch('/api/bitacora/list?kind='+bitKq())).json();
+  if(!d.generating){clearInterval(bitPollT);bitPollT=null;setBitGenerating(false);toast('Bitácora lista','ok');loadBitList((d.dates||[])[0]);}}
+async function genBitacora(){const date=document.getElementById('bitDate').value||undefined;
+  const payload=bitKind==='week'?{weekly:true,date}:{date};
+  const d=await (await fetch('/api/bitacora/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})).json();
+  if(d.started||d.already){setBitGenerating(true);toast('Redactando la bitácora'+(bitKind==='week'?' semanal':'')+'… (un par de minutos)','ok');}}
+
 // init
 document.getElementById('brand').innerHTML=ic('chat','',16)+' PZ Sessions';
 document.getElementById('refreshBtn').innerHTML=ic('refresh');
 document.getElementById('sendBtn').innerHTML=ic('send');
+document.getElementById('bitBtn').innerHTML=ic('book');
+document.getElementById('bitIcon').innerHTML=ic('book','',16);
+document.getElementById('bitClose').innerHTML=ic('x');
 document.getElementById('refreshBtn').addEventListener('click',hardRefresh);
+document.getElementById('bitBtn').addEventListener('click',openBitacora);
+document.getElementById('bitClose').addEventListener('click',closeBitacora);
+document.getElementById('bitGen').addEventListener('click',genBitacora);
+document.getElementById('bitTabDay').addEventListener('click',()=>setBitKind('day'));
+document.getElementById('bitTabWeek').addEventListener('click',()=>setBitKind('week'));
+document.getElementById('bitDate').addEventListener('change',e=>loadBit(e.target.value));
+document.getElementById('bitOverlay').addEventListener('click',e=>{if(e.target.id==='bitOverlay')closeBitacora();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeBitacora();});
 document.getElementById('cName').value=localStorage.getItem('pzChatName')||'';
 loadState();setInterval(loadState,${REFRESH_MS});setInterval(loadChat,3000);
 </script>
