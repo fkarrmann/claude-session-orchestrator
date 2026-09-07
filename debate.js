@@ -20,6 +20,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { readJSON, mutate } = require('./state');
+const LLM = require('./localLlm');
 
 const FILE = path.join(__dirname, 'debates.json');
 const OUT_DIR = process.env.PZ_DECISIONES_DIR ||
@@ -36,32 +37,75 @@ function nextId(all) {
 }
 
 // ─── comandos ────────────────────────────────────────────────────────────────
-function abrir({ me, live }, args) {
+async function abrir({ me, live }, args) {
   const tema = args.tema;
   if (!tema) return { err: 'Falta el tema. Ej: pz debate abrir "¿monolito o servicio aparte?" --criterio "menos piezas móviles"' };
   // convocados: los que se pasen, o todas las sesiones vivas con nombre (incluido yo)
   const convocados = args.con
     ? args.con.split(',').map((s) => s.trim()).filter(Boolean)
     : Array.from(new Set([me, ...live]));
+  // La TERCERA VOZ (modelo local) se convoca sola y propone ACÁ MISMO: en este
+  // momento no existe ninguna otra propuesta, así que su ceguera está garantizada
+  // por construcción. Si no está el servidor, se dice en voz alta y el debate sigue.
+  let tercero = null, sinTercero = null;
+  if (!args.sinTercero) {
+    const motivo = await LLM.porQueNoEsta();
+    if (motivo) sinTercero = motivo;
+    else {
+      try {
+        const r = await LLM.proponer({ tema, criterio: args.criterio, convocados });
+        tercero = { nombre: LLM.nombre, texto: r.texto, ms: r.ms };
+        convocados.push(LLM.nombre);
+      } catch (e) { sinTercero = (e && e.message) || String(e); }
+    }
+  }
   let id;
   mutate(FILE, {}, (all) => {
     id = nextId(all);
     all[id] = {
       id, tema, criterio: args.criterio || null, convocados,
       abiertoPor: me, ts: nowISO(), estado: 'propuestas',
-      propuestas: {}, objeciones: [], decision: null,
+      propuestas: tercero ? { [tercero.nombre]: { texto: tercero.texto, ts: nowISO() } } : {},
+      objeciones: [], decision: null, veredicto: null,
     };
     return all;
   });
+  const nota = tercero
+    ? `\n🧩 Tercera voz convocada (${tercero.nombre}): ya dejó su propuesta sellada, escrita sin ver ninguna otra.`
+    : sinTercero ? `\n⚠️ Sin tercera voz: ${sinTercero}` : '';
   return {
     id,
     say: `🧵 Debate ${id} — ${tema}` + (args.criterio ? `\nCriterio de éxito: ${args.criterio}` : '')
-      + `\nConvocados: ${convocados.join(', ')}. Cada uno propone A CIEGAS (pz debate proponer ${id} "…"); se destapan todas juntas.`,
-    out: `🧵 Debate ${id} abierto. Convocados: ${convocados.join(', ')}\n   Proponé lo tuyo: pz debate proponer ${id} "<tu propuesta>"`,
+      + `\nConvocados: ${convocados.join(', ')}. Cada uno propone A CIEGAS (pz debate proponer ${id} "…"); se destapan todas juntas.` + nota,
+    out: `🧵 Debate ${id} abierto. Convocados: ${convocados.join(', ')}${nota}\n   Proponé lo tuyo: pz debate proponer ${id} "<tu propuesta>"`,
   };
 }
 
-function proponer({ me }, id, texto) {
+// ─── el arbitraje: cuando ya están todas a la vista ──────────────────────────
+// No elige ganador. Dice si en realidad coinciden, cuál es el eje, quién trajo un
+// dato y —lo más valioso— qué no vio NINGUNO. Es lo que un tercero de otra familia
+// de modelos puede ver y los dos que discuten no.
+async function arbitrarYGuardar(id) {
+  const d = load()[id];
+  if (!d || !Object.keys(d.propuestas).length) return null;
+  try {
+    const { veredicto, ms } = await LLM.arbitrar({ tema: d.tema, criterio: d.criterio, propuestas: d.propuestas });
+    mutate(FILE, {}, (all) => { all[id].veredicto = { ...veredicto, por: LLM.nombre, ms, ts: nowISO() }; return all; });
+    return veredicto;
+  } catch { return null; }   // sin árbitro el debate sigue; el texto del destape lo aclara
+}
+
+function veredictoTexto(v) {
+  if (!v) return '';
+  return `\n\n⚖️ Árbitro (${v.por}):`
+    + `\n   ¿Dicen lo mismo?: ${v.convergen ? 'SÍ — ojo, puede ser eco y no acuerdo' : 'no'}`
+    + `\n   Eje real del desacuerdo: ${v.eje_del_desacuerdo || '—'}`
+    + `\n   Trajo dato verificable: ${v.quien_trajo_dato_verificable || 'ninguno'}`
+    + `\n   Experimento que lo zanja: ${v.que_experimento_lo_zanja || '—'}`
+    + `\n   Punto ciego de todas las propuestas: ${v.punto_ciego || '—'}`;
+}
+
+async function proponer({ me }, id, texto) {
   if (!texto) return { err: `Falta tu propuesta. Ej: pz debate proponer ${id || '<id>'} "yo haría X porque Y"` };
   const d0 = load()[id];
   if (!d0) return { err: `No existe el debate ${id}. Ver: pz debate ver` };
@@ -74,11 +118,12 @@ function proponer({ me }, id, texto) {
     return all;
   });
   const faltan = d.convocados.filter((n) => !d.propuestas[n]);
+  const v = faltan.length ? null : await arbitrarYGuardar(id);
   return {
     faltan,
     say: faltan.length
       ? `🔒 ${me} ya propuso en ${id} (sellada). Faltan: ${faltan.join(', ')}.`
-      : `🔓 Debate ${id}: propusieron todos → DESTAPADO. Miren las propuestas y objeten con evidencia: pz debate ver ${id}`,
+      : `🔓 Debate ${id}: propusieron todos → DESTAPADO. Miren las propuestas y objeten con evidencia: pz debate ver ${id}` + veredictoTexto(v),
     out: faltan.length
       ? `🔒 Propuesta sellada en ${id}. Nadie la ve todavía. Faltan: ${faltan.join(', ')}`
       : `🔓 Propuesta guardada y con eso están TODAS: destapadas. Mirá: pz debate ver ${id}`,
@@ -91,14 +136,15 @@ function destapado(d, forzado) {
     d.convocados.every((n) => d.propuestas[n]);
 }
 
-function destapar({ me }, id) {
+async function destapar({ me }, id) {
   const d0 = load()[id];
   if (!d0) return { err: `No existe el debate ${id}.` };
   const faltan = d0.convocados.filter((n) => !d0.propuestas[n]);
   if (!faltan.length) return { err: `${id} ya estaba destapado (propusieron todos).` };
   mutate(FILE, {}, (all) => { all[id].forzado = { por: me, ts: nowISO(), faltaban: faltan }; return all; });
+  const v = await arbitrarYGuardar(id);
   return {
-    say: `🔓 ${me} destapó ${id} sin esperar a ${faltan.join(', ')}. Las propuestas quedan a la vista.`,
+    say: `🔓 ${me} destapó ${id} sin esperar a ${faltan.join(', ')}. Las propuestas quedan a la vista.` + veredictoTexto(v),
     out: `🔓 Destapado ${id} (faltaban: ${faltan.join(', ')}). Mirá: pz debate ver ${id}`,
   };
 }
@@ -145,6 +191,7 @@ function ver({ me }, id) {
       const p = d.propuestas[n];
       L.push(p ? `\n  ── ${n} ──\n  ${p.texto.split('\n').join('\n  ')}` : `\n  ── ${n} ── (no propuso)`);
     }
+    if (d.veredicto) L.push(veredictoTexto(d.veredicto).replace(/^\n\n/, ''));
     if (d.objeciones.length) {
       L.push('', '⚔️ Objeciones:');
       for (const o of d.objeciones) {
@@ -206,6 +253,15 @@ function escribirNota(d) {
     for (const n of d.convocados) {
       const p = d.propuestas[n];
       L.push(`### ${n}`, '', p ? p.texto : '_no propuso_', '');
+    }
+    if (d.veredicto) {
+      const v = d.veredicto;
+      L.push(`## Arbitraje independiente (${v.por})`, '',
+        `- **¿Las propuestas convergen?** ${v.convergen ? 'Sí' : 'No'}`,
+        `- **Eje del desacuerdo:** ${v.eje_del_desacuerdo || '—'}`,
+        `- **Trajo dato verificable:** ${v.quien_trajo_dato_verificable || 'ninguno'}`,
+        `- **Experimento que lo zanja:** ${v.que_experimento_lo_zanja || '—'}`,
+        `- **Punto ciego de todas:** ${v.punto_ciego || '—'}`, '');
     }
     if (d.objeciones.length) {
       L.push('## Objeciones', '');

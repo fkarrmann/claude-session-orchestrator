@@ -607,6 +607,8 @@ if (cmd === 'debate') {
   if (!name) { console.error('Primero presentate: pz join "<nombre>" "<qué hacés>"'); process.exit(1); }
   heartbeat(c);
   const D = require('./debate');
+  const sinTercero = rest.includes('--sin-tercero');
+  if (sinTercero) rest.splice(rest.indexOf('--sin-tercero'), 1);
   const criterio = takeFlag(rest, '--criterio', 300);
   const con = takeFlag(rest, '--con', 200);
   const evidencia = takeFlag(rest, '--evidencia', 2000);
@@ -615,18 +617,21 @@ if (cmd === 'debate') {
   const [sub, a1, a2] = rest;
   const live = Object.values(loadSessions()).map((s) => s.name).filter(Boolean);
   const api = { me: name, live };
-  let r;
-  if (sub === 'abrir') r = D.abrir(api, { tema: a1, criterio, con });
-  else if (sub === 'proponer') r = D.proponer(api, a1, a2);
-  else if (sub === 'destapar') r = D.destapar(api, a1);
-  else if (sub === 'objetar') r = D.objetar(api, a1, a2, evidencia);
-  else if (sub === 'ver' || sub === undefined) r = D.ver(api, a1);
-  else if (sub === 'cerrar') r = D.cerrar(api, a1, decision, abierto);
-  else r = { err: `No conozco "pz debate ${sub}". Son: abrir, proponer, destapar, objetar, ver, cerrar.` };
-  if (r.err) { console.error('✗ ' + r.err); process.exit(1); }
-  if (r.say) post({ from: name, type: r.tipo || 'note', text: r.say, branch: c.branch });
-  if (r.out) console.log(r.out);
-  process.exit(0);
+  (async () => {
+    let r;
+    if (sub === 'abrir') { console.log('… convocando a la tercera voz (modelo local), aguantá unos segundos'); r = await D.abrir(api, { tema: a1, criterio, con, sinTercero }); }
+    else if (sub === 'proponer') r = await D.proponer(api, a1, a2);
+    else if (sub === 'destapar') r = await D.destapar(api, a1);
+    else if (sub === 'objetar') r = D.objetar(api, a1, a2, evidencia);
+    else if (sub === 'ver' || sub === undefined) r = D.ver(api, a1);
+    else if (sub === 'cerrar') r = D.cerrar(api, a1, decision, abierto);
+    else r = { err: `No conozco "pz debate ${sub}". Son: abrir, proponer, destapar, objetar, ver, cerrar.` };
+    if (r.err) { console.error('✗ ' + r.err); process.exit(1); }
+    if (r.say) post({ from: name, type: r.tipo || 'note', text: r.say, branch: c.branch });
+    if (r.out) console.log(r.out);
+    process.exit(0);
+  })().catch((e) => { console.error('✗ pz debate: ' + ((e && e.message) || e)); process.exit(1); });
+  return;
 }
 
 if (cmd === 'whoami') {
@@ -753,7 +758,9 @@ console.log(`pz — Sala de Sesiones${REPO_NAME ? ' · ' + REPO_NAME : ' (sin re
   pz claim <archivos|carpetas...>       tomar (otras sesiones no podrán editarlos; carpeta = todo adentro)
   pz check <archivos...>                ¿están libres? (exit 2 si no) — para agentes sin hooks
   pz release [archivos...]              soltarlos
-  pz debate abrir "<tema>" [--criterio "<cómo decidimos>"] [--con "A,B"]
+  pz debate abrir "<tema>" [--criterio "<cómo decidimos>"] [--con "A,B"] [--sin-tercero]
+                                        convoca sola a una tercera voz: un modelo LOCAL de otra
+                                        familia, que propone a ciegas y después arbitra
   pz debate proponer <id> "<propuesta>"   SELLADA: nadie la ve hasta que estén todas
   pz debate objetar <id> "<objeción>" [--evidencia "<comando + salida>"]
   pz debate ver [<id>]  ·  destapar <id>  ·  cerrar <id> --decision "…" [--abierto "<desacuerdo>"]

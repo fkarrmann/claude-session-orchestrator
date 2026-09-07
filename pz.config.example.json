@@ -3,5 +3,10 @@
   "mainBranch": "main",
   "port": 4646,
   "owner": "",
-  "envDirs": [""]
+  "envDirs": [""],
+  "localLlm": {
+    "url": "http://127.0.0.1:8090/v1",
+    "model": "",
+    "nombre": "Qwen local 🧩"
+  }
 }

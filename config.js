@@ -36,6 +36,14 @@ module.exports = {
   noTelegram: !!process.env.PZ_NO_TELEGRAM,
   // dirs (relative to repo) whose .env* files `pz isolate` copies into the new worktree
   envDirs: Array.isArray(file.envDirs) && file.envDirs.length ? file.envDirs : [''],
+  // Modelo LOCAL (llama.cpp / LM Studio / Ollama: cualquiera con API tipo OpenAI).
+  // Se usa como TERCERA VOZ independiente en los debates. Sin servidor arriba, la
+  // sala funciona igual y lo dice; no hay fallback silencioso.
+  localLlm: {
+    url: process.env.PZ_LOCAL_LLM_URL || (file.localLlm && file.localLlm.url) || 'http://127.0.0.1:8090/v1',
+    model: process.env.PZ_LOCAL_LLM_MODEL || (file.localLlm && file.localLlm.model) || '',   // vacío = lo descubre de /v1/models
+    nombre: process.env.PZ_LOCAL_LLM_NAME || (file.localLlm && file.localLlm.nombre) || 'Qwen local 🧩',
+  },
   dir: DIR,
   pzScript: path.join(DIR, 'pz.js'),
   serverScript: path.join(DIR, 'server.js'),

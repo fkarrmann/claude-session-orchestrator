@@ -111,7 +111,7 @@ decided or why. `pz debate` is a thread with three rules, each one there to fix 
 failure we actually hit:
 
 ```bash
-pz debate abrir "<topic>" --criterio "<how we'll know which idea won>" [--con "A,B"]
+pz debate abrir "<topic>" --criterio "<how we'll know which idea won>" [--con "A,B"] [--sin-tercero]
 pz debate proponer <id> "<your proposal>"      # SEALED — nobody sees it until everyone has proposed
 pz debate objetar  <id> "<objection>" --evidencia "<command + its output>"
 pz debate ver [<id>]  ·  destapar <id>         # unseal by hand if someone never showed up
@@ -130,6 +130,34 @@ pz debate cerrar   <id> --decision "…" [--abierto "<what you couldn't agree on
   (`~/Documents/PicnicZero-Docs/Decisiones`, or `PZ_DECISIONES_DIR`) with the decision,
   the proposals, the objections and their evidence. The chat is truncated at 1000
   messages; the decision outlives it.
+
+### The third voice
+
+If a local LLM is reachable, `debate abrir` convenes it automatically as a third
+participant. The point is not that it's smart — it usually isn't, next to the frontier
+models arguing. The point is that it comes from **a different model family and fails
+differently**. Two agents from the same lineage converge; a third one that doesn't share
+their blind spots is worth more than its raw quality, and being local it costs nothing,
+so it can join *every* debate — which is the only way a third voice means anything.
+
+It plays by the same rules as everyone: it writes its proposal at `abrir`, when no other
+proposal exists yet, so its blindness is guaranteed by construction. When everything is
+unsealed it also acts as **arbiter**, and answers five questions: do the proposals actually
+converge (an echo dressed up as agreement), what the real axis of disagreement is, who
+brought a verifiable fact, what cheap experiment settles it, and — the valuable one —
+what **none** of the proposals mention. The verdict goes into the room and into the vault note.
+
+The proposals reach the arbiter **anonymously**: it is the same model that proposed, and
+with the names visible it picked itself as the one who brought the data.
+
+Point it at any OpenAI-compatible server (llama.cpp, LM Studio, Ollama) via `localLlm`
+in `pz.config.json` or `PZ_LOCAL_LLM_URL`; the model id is discovered from `/v1/models`.
+If the server is down, the debate runs without it and says so out loud — no silent fallback.
+
+> **Gotcha with reasoning models:** they must be called with thinking disabled
+> (`chat_template_kwargs: {enable_thinking: false}`, which `localLlm.js` always sends).
+> Measured on Qwen3.5-35B-A3B: with thinking it burned the whole token budget and returned
+> an empty answer in 18s; with thinking off, clean JSON in 3s.
 
 And the escalation rule: if the debate closes with `--abierto`, that disagreement is
 not the agents' call — it goes to the human as an `ask` (their phone rings). If they
@@ -241,6 +269,7 @@ so a fresh clone never interferes with unrelated projects until you set it up.
 | `state.js` | Shared state layer: atomic writes that fail loudly + `mutate()` under a lock so concurrent sessions don't lose each other's updates. |
 | `config.js` | Shared config loader (reads `pz.config.json`, env overrides, defaults). |
 | `debate.js` | Decision threads: sealed proposals, objections with evidence, a close that's written to the vault. |
+| `localLlm.js` | The third voice: a local OpenAI-compatible model that proposes blind and then arbitrates. |
 | `pz.config.example.json` | Template config. |
 | `sessions.json` · `claims.json` · `chat.json` · `registry.json` · `debates.json` | Runtime state (auto-created, git-ignored). |
 
