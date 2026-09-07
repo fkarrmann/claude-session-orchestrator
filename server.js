@@ -219,7 +219,7 @@ setInterval(refresh, REFRESH_MS);
 
 // ─── Posteo de mensajes al chat ──────────────────────────────────────────────
 let msgCounter = 0;
-function postMessage({ from, type, text, files, branch }) {
+function postMessage({ from, type, text, files, branch, to }) {
   if (!from || !text) return { ok: false, error: 'Falta nombre o texto.' };
   const msg = {
     id: Date.now() + '-' + (msgCounter++),
@@ -227,6 +227,7 @@ function postMessage({ from, type, text, files, branch }) {
     type: ['claim', 'done', 'warn', 'ask', 'note', 'join'].includes(type) ? type : 'note',
     text: String(text).slice(0, 1000),
     files: Array.isArray(files) ? files.slice(0, 20) : [],
+    ...(to ? { to: String(to).slice(0, 40) } : {}),   // dirigido a un agente puntual
     branch: branch || null,
     ts: new Date().toISOString(),
   };
@@ -256,12 +257,16 @@ function checkNotify() {
     const ownerStart = ownerName ? new RegExp('^' + escRe(ownerName), 'i') : null;            // sus propios mensajes
     // no hacer eco de lo que entró por Telegram (firmado "X (Telegram)") ni de los propios mensajes del owner
     const notMine = (m) => !/\(telegram\)\s*$/i.test(m.from || '') && !(ownerStart && ownerStart.test(m.from || ''));
+    // Un mensaje dirigido a OTRO agente es coordinación entre sesiones: no es asunto
+    // del humano. Sin esto, cada "¿tomás vos este archivo?" entre agentes le sonaba el
+    // teléfono. Dirigido al owner (o sin destinatario) sí lo es.
+    const toOther = (m) => m.to && !(ownerName && m.to.toLowerCase() === ownerName.toLowerCase());
     // Banner local (macOS): ask/warn, y mención del owner por su nombre (si está configurado)
-    const isForBanner = (m) => (NOTIFY_TYPES[m.type] || (ownerWord && ownerWord.test(m.text))) && notMine(m);
+    const isForBanner = (m) => (NOTIFY_TYPES[m.type] || (ownerWord && ownerWord.test(m.text))) && notMine(m) && !toOther(m);
     // Telegram (el teléfono): SOLO opt-in explícito — preguntas formales (ask, llevan
     // botones y esperan respuesta) o mensajes con "@owner" CON arroba (decisión deliberada
     // de "esto me llega al teléfono"). Los warns/notes de coordinación NO van.
-    const isForTg = (m) => (m.type === 'ask' || (ownerAt && ownerAt.test(m.text))) && notMine(m);
+    const isForTg = (m) => (m.type === 'ask' || (ownerAt && ownerAt.test(m.text))) && notMine(m) && !toOther(m);
     const fresh = chat.filter((m) => m.ts > lastNotifiedTs);
     lastNotifiedTs = chat[chat.length - 1].ts;
     const news = fresh.filter(isForBanner);
@@ -355,7 +360,7 @@ async function tgHandle(u) {
   // respuesta escrita: si es reply a una pregunta puntual, la ruteo a ese asker
   const ref = msg.reply_to_message && tgSent[msg.reply_to_message.message_id];
   const who = ownerName || (msg.from && msg.from.first_name) || 'Owner';
-  postMessage({ from: who + ' (Telegram)', type: 'note', text: (ref && ref.from ? '→ ' + ref.from + ': ' : '') + msg.text.slice(0, 900) });
+  postMessage({ from: who + ' (Telegram)', type: 'note', to: (ref && ref.from) || null, text: (ref && ref.from ? '→ ' + ref.from + ': ' : '') + msg.text.slice(0, 900) });
   await tgApi('setMessageReaction', { chat_id: msg.chat.id, message_id: msg.message_id, reaction: [{ type: 'emoji', emoji: '👍' }] });
 }
 let tgOffset = 0, tgPolling = false;
@@ -547,6 +552,7 @@ const HTML = /* html */ `<!doctype html>
   .mtype.warn{color:var(--pz-red);border-color:rgba(248,81,73,.4);background:rgba(248,81,73,.08)}
   .mtype.ask{color:var(--pz-accent);border-color:rgba(var(--pz-accent-rgb),.4);background:rgba(var(--pz-accent-rgb),.08)}
   .mtype.join{color:var(--pz-purple);border-color:rgba(167,139,250,.35);background:rgba(167,139,250,.08)}
+  .msg-to{display:inline-flex;align-items:center;gap:1px;font-size:11px;color:var(--pz-muted);border:1px solid var(--pz-border);border-radius:20px;padding:1px 8px 1px 4px}
   .msg-time{font-size:10.5px;color:var(--pz-muted);margin-left:auto}
   .msg-body{font-size:13.5px;line-height:1.5;color:var(--pz-text);background:var(--pz-card);border:1px solid var(--pz-border);
     border-radius:12px;border-top-left-radius:4px;padding:9px 13px;word-break:break-word;white-space:pre-wrap;transition:border-color .2s}
@@ -648,6 +654,16 @@ const HTML = /* html */ `<!doctype html>
   .bit-body hr{border:0;border-top:1px solid var(--pz-border);margin:1.4em 0}
   .bit-fm{font-family:var(--mono);font-size:11px;color:var(--pz-muted);background:var(--pz-card-in);border:1px solid var(--pz-border);border-radius:8px;padding:8px 12px;margin-bottom:14px;white-space:pre-wrap}
   .bit-empty{color:var(--pz-muted);text-align:center;padding:50px 20px}
+  /* El generador quedó mudo: punto rojo en el botón + cartel adentro del modal. */
+  .icon-btn.alert{position:relative;border-color:rgba(248,81,73,.45);color:var(--pz-red)}
+  .icon-btn.alert::after{content:'';position:absolute;top:-3px;right:-3px;width:9px;height:9px;
+    border-radius:50%;background:var(--pz-red);border:2px solid var(--pz-body)}
+  .bit-alert{display:flex;gap:9px;align-items:flex-start;margin:0 0 16px;padding:11px 14px;border-radius:9px;
+    background:rgba(248,81,73,.09);border:1px solid rgba(248,81,73,.32);font-size:12.5px;line-height:1.6;color:#ffd0d0}
+  .bit-alert b{color:#ffb4b4}
+  .bit-alert .ic{color:var(--pz-red);flex:none;margin-top:2px}
+  .bit-alert code{font-family:var(--mono);font-size:12px;background:rgba(248,81,73,.14);
+    border:1px solid rgba(248,81,73,.3);border-radius:5px;padding:1px 5px;color:#ffd0d0}
 </style></head>
 <body>
 <header>
@@ -718,6 +734,7 @@ const TYPE_LABEL={claim:'me agarro',done:'terminó',warn:'ojo',ask:'pregunta',jo
 
 // ── Íconos (Bootstrap Icons, inline SVG — cero dependencias, sin emojis) ──
 const ICON={
+  'arrow-right-short':'<path fill-rule="evenodd" d="M4 8a.5.5 0 0 1 .5-.5h5.793L8.146 5.354a.5.5 0 1 1 .708-.708l3 3a.5.5 0 0 1 0 .708l-3 3a.5.5 0 0 1-.708-.708L10.293 8.5H4.5A.5.5 0 0 1 4 8"/>',
   chat:'<path d="M2.678 11.894a1 1 0 0 1 .287.801 11 11 0 0 1-.398 2c1.395-.323 2.247-.697 2.634-.893a1 1 0 0 1 .71-.074A8 8 0 0 0 8 14c3.996 0 7-2.807 7-6 0-3.192-3.004-6-7-6S1 4.808 1 8c0 1.468.617 2.83 1.678 3.894m-.493 3.905a22 22 0 0 1-.713.129c-.2.032-.352-.176-.273-.362a10 10 0 0 0 .244-.637l.003-.01c.248-.72.45-1.548.524-2.319C.743 11.37 0 9.76 0 8c0-3.866 3.582-7 8-7s8 3.134 8 7-3.582 7-8 7a9 9 0 0 1-2.347-.306c-.52.263-1.639.742-3.468 1.105"/>',
   danger:'<path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5m.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2"/>',
   refresh:'<path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2z"/><path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466"/>',
@@ -774,6 +791,7 @@ function renderChat(chat){
   if(!chat.length){log.innerHTML='<div class="chat-empty">Todavía nadie habló.<br>Las sesiones se presentan acá y avisan qué hacen — y vos también escribís.</div>';return;}
   log.innerHTML=chat.map(m=>{const t=fmtTime(m.ts);const tl=TYPE_LABEL[m.type]||'';
     return '<div class="msg"><div class="msg-top">'+chip(m.from)
+      +(m.to?'<span class="msg-to" title="dirigido a '+esc(m.to)+' — no te notifica a vos">'+ic('arrow-right-short')+esc(m.to)+'</span>':'')
       +(tl?'<span class="mtype '+m.type+'">'+tl+'</span>':'')
       +'<span class="msg-time" title="'+t.full+'">'+t.rel+'</span></div>'
       +'<div class="msg-body">'+esc(m.text)
@@ -917,11 +935,21 @@ async function loadBitList(sel){
   sd.value=(sel&&dates.includes(sel))?sel:dates[0];
   await loadBit(sd.value);
   setBitGenerating(d.generating);}
+// Cartel rojo con el motivo REAL del último fallo. Sin esto, "no hay bitácora"
+// se confunde con "no hubo trabajo ese día" y el problema queda invisible.
+const BTICK=new RegExp('\\x60([^\\x60]+)\\x60','g'); // backticks del mensaje → <code> (no se pueden escribir literales acá)
+function bitAlertHtml(st){
+  if(!st||st.ok!==false)return '';
+  const when=new Date(st.ts).toLocaleString('es-AR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+  const per=(st.kind==='week'?'semanal ':'diaria ')+(st.label||st.date||'');
+  return '<div class="bit-alert">'+ic('danger',null,16)+'<span><b>El generador está caído.</b> La última corrida ('
+    +esc(per)+', '+esc(when)+') falló y no se escribió nada nuevo.<br>'
+    +esc(st.error||'error desconocido').replace(BTICK,'<code>$1</code>')+'</span></div>';}
 async function loadBit(date){const body=document.getElementById('bitBody');
   if(!date){body.innerHTML='<div class="bit-empty">Elegí un período.</div>';return;}
   const d=await (await fetch('/api/bitacora?kind='+bitKq()+'&date='+encodeURIComponent(date))).json();
   const per=bitKind==='week'?'de la semana <b>'+esc(weekLabel(date))+'</b>':'de <b>'+esc(date)+'</b>';
-  body.innerHTML=d.md?mdToHtml(d.md):'<div class="bit-empty">Todavía no hay bitácora '+per+'.<br>Apretá <b>generar</b> para crearla.</div>';
+  body.innerHTML=bitAlertHtml(d.status)+(d.md?mdToHtml(d.md):'<div class="bit-empty">Todavía no hay bitácora '+per+'.<br>Apretá <b>generar</b> para crearla.</div>');
   body.scrollTop=0;}
 function setBitGenerating(on){document.getElementById('bitGen').disabled=!!on;document.getElementById('bitSpin').style.display=on?'inline':'none';
   if(on&&!bitPollT)bitPollT=setInterval(pollBitDone,4000);}

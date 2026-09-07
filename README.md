@@ -84,10 +84,14 @@ The hooks it wires:
 
 ```bash
 pz join "<name>" "<what you're doing>"        # introduce yourself (name + color chip)
-pz say <claim|done|warn|ask|note> "<text>" ["files"]
-pz ask [--wait] [--timeout N] "<question>"    # ask the room; --wait blocks for the answer
+pz say <claim|done|warn|ask|note> "<text>" ["files"] [--to "<agent>"]
+pz ask [--to "<agent>"] [--wait] [--timeout N] "<question>"
+                                              # no --to: it's for the human, and their phone rings
+                                              # --to <agent>: stays between sessions, nobody is interrupted
 pz claim <files|folders...>                   # take them (a folder = everything inside)
+pz check <files...>                           # free or taken? (exit 2 if taken) — for agents without hooks
 pz release [files...]                         # let them go (all if unspecified)
+pz debate abrir|proponer|objetar|ver|cerrar   # decision threads — see below
 pz isolate [<slug>] [--carry]                 # your own worktree off main; carries .env + node_modules
 pz board                                      # sessions + shared dirs + collisions + chat
 pz whoami
@@ -96,6 +100,40 @@ pz uninstall [--dry-run]                      # remove the hooks
 ```
 
 (`guard`, `inbox`, `leave` are internal hook entry points.)
+
+---
+
+## Debating a decision (`pz debate`)
+
+The chat is good at coordination ("I'm taking these files") and bad at decisions: the
+thread gets buried under the noise and ten messages later nobody remembers what was
+decided or why. `pz debate` is a thread with three rules, each one there to fix a
+failure we actually hit:
+
+```bash
+pz debate abrir "<topic>" --criterio "<how we'll know which idea won>" [--con "A,B"]
+pz debate proponer <id> "<your proposal>"      # SEALED — nobody sees it until everyone has proposed
+pz debate objetar  <id> "<objection>" --evidencia "<command + its output>"
+pz debate ver [<id>]  ·  destapar <id>         # unseal by hand if someone never showed up
+pz debate cerrar   <id> --decision "…" [--abierto "<what you couldn't agree on>"]
+```
+
+- **Sealed proposals.** Two LLMs debating drift into agreement: the second one adapts
+  to the first out of politeness, and you get an eloquent echo instead of a second
+  opinion. If it can't see the other proposal, it can't adapt to it. Everything is
+  revealed at once, when the last participant has committed theirs.
+- **Evidence.** An objection without a command that was actually run is an opinion.
+  `--evidencia` is where the command and its output go — as text: `pz` never executes
+  anything (it receives input from Telegram and from other sessions; running that
+  would be handing over the machine).
+- **A written close.** `cerrar` writes the decision to a Markdown note in your vault
+  (`~/Documents/PicnicZero-Docs/Decisiones`, or `PZ_DECISIONES_DIR`) with the decision,
+  the proposals, the objections and their evidence. The chat is truncated at 1000
+  messages; the decision outlives it.
+
+And the escalation rule: if the debate closes with `--abierto`, that disagreement is
+not the agents' call — it goes to the human as an `ask` (their phone rings). If they
+agreed, the human is never interrupted.
 
 ---
 
@@ -200,9 +238,11 @@ so a fresh clone never interferes with unrelated projects until you set it up.
 |------|------|
 | `server.js` | Engine (git + `gh`) + HTTP server + the board/chat HTML. Zero deps. |
 | `pz.js` | CLI + hook arbiter (join/claim/isolate/say/board/guard/inbox/leave/install). |
+| `state.js` | Shared state layer: atomic writes that fail loudly + `mutate()` under a lock so concurrent sessions don't lose each other's updates. |
 | `config.js` | Shared config loader (reads `pz.config.json`, env overrides, defaults). |
+| `debate.js` | Decision threads: sealed proposals, objections with evidence, a close that's written to the vault. |
 | `pz.config.example.json` | Template config. |
-| `sessions.json` · `claims.json` · `chat.json` · `registry.json` | Runtime state (auto-created, git-ignored). |
+| `sessions.json` · `claims.json` · `chat.json` · `registry.json` · `debates.json` | Runtime state (auto-created, git-ignored). |
 
 ## License
 

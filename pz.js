@@ -166,10 +166,11 @@ function releaseClaims(sid, files) {
 
 // ─── chat ──────────────────────────────────────────────────────────────────
 let counter = 0;
-function post({ from, type, text, files, branch }) {
+function post({ from, type, text, files, branch, to }) {
   mutate(CHAT, [], (chat) => {
   chat.push({
     id: now() + '-' + (counter++), from: String(from).slice(0, 40),
+    ...(to ? { to: String(to).slice(0, 40) } : {}),
     type: ['claim', 'done', 'warn', 'ask', 'note', 'join'].includes(type) ? type : 'note',
     text: String(text).slice(0, 1000),
     files: files ? (Array.isArray(files) ? files : String(files).split(',')).map((s) => String(s).trim()).filter(Boolean).slice(0, 20) : [],
@@ -194,6 +195,15 @@ function saveLegacyLabel(c, patch) {
     reg[c.cwd] = entry;
     return reg;
   });
+}
+
+// --flag "valor" → devuelve el valor y lo SACA de args (los subcomandos usan posicionales)
+function takeFlag(args, flag, max = 40) {
+  const i = args.indexOf(flag);
+  if (i < 0) return null;
+  const v = args[i + 1];
+  args.splice(i, v === undefined ? 1 : 2);
+  return v === undefined ? null : String(v).slice(0, max);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -306,10 +316,13 @@ if (cmd === 'inbox') {
     const news = chat.filter((m) => new Date(m.ts).getTime() > seen && m.from !== me.name);
     if (!news.length) process.exit(0);
     markChatSeen(c.sid, chat[chat.length - 1].ts);
-    const fmt = (m) => `[${new Date(m.ts).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })}] ${m.from} (${m.type}): ${m.text}`;
+    const fmt = (m) => `[${new Date(m.ts).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })}] ${m.from}${m.to ? ` → ${m.to === me.name ? 'VOS' : m.to}` : ''} (${m.type}): ${m.text}`;
+    const forMe = news.filter((m) => m.to && m.to === me.name);
     const text = `📨 Sala PZ — ${news.length} mensaje(s) nuevo(s) mientras trabajás:\n`
       + news.slice(-10).map(fmt).join('\n')
-      + `\n(Si te afecta o te preguntan algo, respondé: pz say note "...". Si no, seguí con lo tuyo.)`;
+      + (forMe.length
+        ? `\n⏳ ${forMe.length} te lo escribieron A VOS y esperan respuesta: pz say note --to "${forMe[forMe.length - 1].from}" "..."`
+        : `\n(Si te afecta o te preguntan algo, respondé: pz say note "...". Si no, seguí con lo tuyo.)`);
     if ((hook.hook_event_name || '') === 'PostToolUse') {
       console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: text } }));
     } else {
@@ -325,14 +338,18 @@ if (cmd === 'ask') {
   const name = myName(c);
   if (!name) { console.error('Primero presentate: pz join "<nombre>"'); process.exit(1); }
   heartbeat(c);
+  // --to <agente>: la pregunta es para OTRA sesión, no para el humano. Sin --to,
+  // un ask es una interrupción al humano (le suena el teléfono) — que es lo que debe ser.
+  const to = takeFlag(rest, '--to');
   const wait = rest.includes('--wait');
   const ti = rest.indexOf('--timeout');
   const timeoutS = ti >= 0 ? Math.max(10, parseInt(rest[ti + 1], 10) || 90) : 90;
   const text = rest.filter((r, i) => r !== '--wait' && r !== '--timeout' && !(ti >= 0 && i === ti + 1))[0];
   if (!text) { console.error('Falta la pregunta. Ej: pz ask --wait "¿priorizo A o B?"'); process.exit(1); }
-  post({ from: name, type: 'ask', text, branch: c.branch });
-  if (!wait) { console.log(`❓ [${name}] pregunta posteada en la sala.`); process.exit(0); }
-  console.log(`❓ Pregunta posteada. Espero respuesta hasta ${timeoutS}s… (con --timeout N esperás más; ojo el timeout del Bash tool)`);
+  post({ from: name, type: 'ask', text, branch: c.branch, to });
+  const dest = to ? `para ${to}` : `para ${CFG.owner || 'el humano'} (le llega al teléfono)`;
+  if (!wait) { console.log(`❓ [${name}] pregunta posteada ${dest}.`); process.exit(0); }
+  console.log(`❓ Pregunta posteada ${dest}. Espero respuesta hasta ${timeoutS}s… (con --timeout N esperás más; ojo el timeout del Bash tool)`);
   const since = Date.now();
   while (Date.now() - since < timeoutS * 1000) {
     sleep(4000);
@@ -342,7 +359,7 @@ if (cmd === 'ask') {
     // respuesta = mensaje posterior de OTRO autor que me menciona, o de alguien
     // que no es una sesión viva (o sea: el usuario escribiendo en el tablero)
     const replies = chat.filter((m) => new Date(m.ts).getTime() > since && m.from !== name)
-      .filter((m) => m.text.toLowerCase().includes(name.toLowerCase()) || !live.has(m.from));
+      .filter((m) => m.to === name || m.text.toLowerCase().includes(name.toLowerCase()) || !live.has(m.from));
     if (replies.length) {
       markChatSeen(c.sid, chat[chat.length - 1].ts);
       console.log('💬 Respuesta(s):');
@@ -376,10 +393,11 @@ if (cmd === 'say') {
   const name = myName(c);
   if (!name) { console.error('Primero presentate: pz join "<nombre>" "<qué hacés>"'); process.exit(1); }
   heartbeat(c);
+  const to = takeFlag(rest, '--to');   // dirigido a un agente: le queda como turno pendiente
   const [type, text, files] = rest;
   if (!text) { console.error('Falta el texto. Ej: pz say claim "toco schedule" "main.js,styles.css"'); process.exit(1); }
-  post({ from: name, type, text, files, branch: c.branch });
-  console.log(`✓ [${name}] ${type}: ${text}`);
+  post({ from: name, type, text, files, branch: c.branch, to });
+  console.log(`✓ [${name}]${to ? ` → ${to}` : ''} ${type}: ${text}`);
   process.exit(0);
 }
 
@@ -582,6 +600,35 @@ if (cmd === 'bitacora') {
   process.exit(0);
 }
 
+// ─── debate ─ hilos de decisión: propuesta sellada, objeción con evidencia, cierre escrito
+if (cmd === 'debate') {
+  const c = ctx({});
+  const name = myName(c);
+  if (!name) { console.error('Primero presentate: pz join "<nombre>" "<qué hacés>"'); process.exit(1); }
+  heartbeat(c);
+  const D = require('./debate');
+  const criterio = takeFlag(rest, '--criterio', 300);
+  const con = takeFlag(rest, '--con', 200);
+  const evidencia = takeFlag(rest, '--evidencia', 2000);
+  const decision = takeFlag(rest, '--decision', 2000);
+  const abierto = takeFlag(rest, '--abierto', 2000);
+  const [sub, a1, a2] = rest;
+  const live = Object.values(loadSessions()).map((s) => s.name).filter(Boolean);
+  const api = { me: name, live };
+  let r;
+  if (sub === 'abrir') r = D.abrir(api, { tema: a1, criterio, con });
+  else if (sub === 'proponer') r = D.proponer(api, a1, a2);
+  else if (sub === 'destapar') r = D.destapar(api, a1);
+  else if (sub === 'objetar') r = D.objetar(api, a1, a2, evidencia);
+  else if (sub === 'ver' || sub === undefined) r = D.ver(api, a1);
+  else if (sub === 'cerrar') r = D.cerrar(api, a1, decision, abierto);
+  else r = { err: `No conozco "pz debate ${sub}". Son: abrir, proponer, destapar, objetar, ver, cerrar.` };
+  if (r.err) { console.error('✗ ' + r.err); process.exit(1); }
+  if (r.say) post({ from: name, type: r.tipo || 'note', text: r.say, branch: c.branch });
+  if (r.out) console.log(r.out);
+  process.exit(0);
+}
+
 if (cmd === 'whoami') {
   const c = ctx({});
   const s = readJSON(SESSIONS, {})[c.sid];
@@ -614,6 +661,22 @@ if (cmd === 'board') {
   } else if (othersHere.length) {
     out.push(`ℹ️  Hay ${othersHere.length} sesión(es) recién abierta(s) (sin presentarse) en este directorio — si empiezan a trabajar acá, aislate con pz isolate.`);
     out.push('');
+  }
+
+  // ⏳ ¿Me hablaron a MÍ y todavía no contesté? (lo que se dirige a un agente no
+  // interrumpe al humano, así que el recordatorio tiene que estar acá.)
+  const meName = myName(c);
+  if (meName) {
+    const chatAll = readJSON(CHAT, []);
+    const lastMine = [...chatAll].reverse().find((m) => m.from === meName);
+    const sinceMine = lastMine ? new Date(lastMine.ts).getTime() : 0;
+    const pending = chatAll.filter((m) => m.to === meName && new Date(m.ts).getTime() > sinceMine);
+    if (pending.length) {
+      out.push(`⏳ TE HABLARON A VOS y no contestaste (${pending.length}):`);
+      for (const m of pending.slice(-3)) out.push(`  • ${m.from}: ${m.text.slice(0, 120)}`);
+      out.push(`   Contestá: pz say note --to "${pending[pending.length - 1].from}" "..."`);
+      out.push('');
+    }
   }
 
   // 🦴 ¿Este worktree es un museo? Avisar ANTES de que la sesión saque conclusiones
@@ -668,6 +731,9 @@ if (cmd === 'board') {
     out.push('  2) Al saber tu tarea → pz join "<nombre con onda>" "<qué hacés>"');
     out.push('  3) Tomá lo que vas a tocar → pz claim <archivos o carpetas>   (el sistema frena a quien intente pisarlos)');
     out.push('  4) ¿Duda que sólo el usuario puede resolver? → pz ask --wait "<pregunta>" [--timeout 300] (espera la respuesta del chat; ajustá el timeout del Bash tool acorde)');
+    out.push('     ¿Es para OTRO agente, no para el usuario? → agregá --to "<agente>" y no le suena el teléfono a nadie');
+    out.push('  4b) ¿Decisión de fondo sin número que la resuelva (arquitectura, prioridades)? → pz debate abrir "<tema>" --criterio "<cómo decidimos>"');
+    out.push('      Cada uno propone A CIEGAS (pz debate proponer <id>), se destapan juntas, se objeta CON evidencia y se cierra con decisión escrita.');
     out.push('  5) Al terminar → pz say done "<resultado / PR #>"');
     out.push('  Los mensajes nuevos de la sala te van a llegar solos mientras trabajás (hook inbox) — no hace falta pollear.');
     out.push('  Tablero + chat (para el usuario): http://localhost:' + CFG.port);
@@ -680,11 +746,19 @@ if (cmd === 'board') {
 
 console.log(`pz — Sala de Sesiones${REPO_NAME ? ' · ' + REPO_NAME : ' (sin repo configurado — corré: pz install <ruta-al-repo>)'}
   pz join "<nombre>" "<qué hacés>"      presentarse (elegí un nombre con onda)
-  pz say <claim|done|warn|ask|note> "<texto>" ["files"]
-  pz ask [--wait] [--timeout N] "<pregunta>"   preguntar a la sala (--wait espera la respuesta)
+  pz say <claim|done|warn|ask|note> "<texto>" ["files"]   (--to "<agente>" para dirigirlo)
+  pz ask [--to "<agente>"] [--wait] [--timeout N] "<pregunta>"
+                                        sin --to la pregunta es para el humano y le suena el teléfono;
+                                        con --to queda entre agentes y no lo molesta
   pz claim <archivos|carpetas...>       tomar (otras sesiones no podrán editarlos; carpeta = todo adentro)
   pz check <archivos...>                ¿están libres? (exit 2 si no) — para agentes sin hooks
   pz release [archivos...]              soltarlos
+  pz debate abrir "<tema>" [--criterio "<cómo decidimos>"] [--con "A,B"]
+  pz debate proponer <id> "<propuesta>"   SELLADA: nadie la ve hasta que estén todas
+  pz debate objetar <id> "<objeción>" [--evidencia "<comando + salida>"]
+  pz debate ver [<id>]  ·  destapar <id>  ·  cerrar <id> --decision "…" [--abierto "<desacuerdo>"]
+                                        el cierre escribe la decisión en el vault; si algo queda
+                                        abierto, ESO sí se le escala al humano
   pz isolate [<slug>] [--carry]         crear tu worktree propio off main y mudarte (lleva .env y node_modules)
   pz board                              ver otras sesiones + chat
   pz bitacora [--date D] [--weekly] [--json]   generar bitácora diaria o semanal (2 capas) → Obsidian + tablero
