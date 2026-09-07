@@ -154,6 +154,20 @@ Point it at any OpenAI-compatible server (llama.cpp, LM Studio, Ollama) via `loc
 in `pz.config.json` or `PZ_LOCAL_LLM_URL`; the model id is discovered from `/v1/models`.
 If the server is down, the debate runs without it and says so out loud — no silent fallback.
 
+> **The failure mode you must design around:** when these models don't know a fact, they
+> don't stop — they complete a plausible reality, with impeccable confidence. Measured twice
+> on Qwen3.5-35B-A3B: asked for its favourite song by a well-known artist, it invented the
+> song, then wrote a detailed analysis of the song it had just invented, then recommended an
+> album that doesn't exist either; and in a real debate in this room it invented that we were
+> discussing credentials and a `.env` file nobody had mentioned. Disagreeing is what it's
+> there for; *naming things that don't exist* is what poisons the well. So `localLlm.js` sends
+> an inviolable rule with every call: never assert that any file, function, endpoint, package,
+> table or number exists unless it is written literally in the message; if a fact is missing,
+> say what would have to be measured instead of filling it in. Verified on the same debate that
+> had produced the invention: zero invented entities, and it now says out loud what it can't
+> check. Keep the model on the ground where it's good (reasoning about what it is shown) and
+> off the one where it fails (recalling).
+
 > **Gotcha with reasoning models:** they must be called with thinking disabled
 > (`chat_template_kwargs: {enable_thinking: false}`, which `localLlm.js` always sends).
 > Measured on Qwen3.5-35B-A3B: with thinking it burned the whole token budget and returned

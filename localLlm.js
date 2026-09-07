@@ -23,6 +23,22 @@ const BASE = String(CFG.localLlm.url || '').replace(/\/+$/, '');   // .../v1
 const PING_MS = 2500;      // ¿está vivo? tiene que ser barato
 const GEN_MS = 120000;     // generar puede tardar: 35B en 3 bits hace ~35 tokens/s
 
+// Regla anti-invención. Estos modelos, cuando NO saben un hecho, completan una
+// realidad plausible en vez de frenar — y lo hacen con una seguridad impecable.
+// Medido dos veces: le pidieron su canción favorita de Cerati e inventó el tema, el
+// análisis del tema inventado y el disco que lo contiene; y en un debate de esta sala
+// se inventó que discutíamos credenciales y un .env que nadie había mencionado.
+// El daño no está en opinar distinto —para eso se lo convoca— sino en nombrar cosas
+// que no existen: un archivo, un endpoint, un número. Por eso se le prohíbe el terreno
+// donde falla (recordar) y se lo deja en el que le sirve (razonar sobre lo que tiene
+// delante). Ver README, sección "The third voice".
+const ANTI_INVENCION =
+  ' REGLA INVIOLABLE: no afirmes que existe ningún archivo, función, endpoint, paquete, tabla, ' +
+  'herramienta, número o resultado que no esté escrito literalmente en este mensaje. No los nombres, ' +
+  'ni de ejemplo. Si te falta un dato, no lo completes: decí qué habría que medir para tenerlo. ' +
+  'Hablá de criterios, riesgos y consecuencias — ese es tu aporte, no los detalles del sistema, ' +
+  'que no ves. Inventar un detalle concreto arruina todo lo demás que digas.';
+
 let _model = null;
 
 async function post(pathname, body, ms) {
@@ -86,7 +102,7 @@ async function proponer({ tema, criterio, convocados }) {
       'Sos la TERCERA VOZ de un debate técnico entre dos agentes de IA que trabajan sobre el mismo repositorio. ' +
       'Tu valor no es ser el más brillante: es ser INDEPENDIENTE. Venís de otra familia de modelos y ves cosas que ellos no. ' +
       'Dás tu postura propia, concreta y corta. Si el tema requiere un dato que no tenés, decí qué medirías para saberlo. ' +
-      'Nunca digas "depende" sin comprometerte con una opción. Máximo 120 palabras, sin markdown, sin preámbulos.' },
+      'Nunca digas "depende" sin comprometerte con una opción. Máximo 120 palabras, sin markdown, sin preámbulos.' + ANTI_INVENCION },
     { role: 'user', content:
       `Tema del debate: ${tema}\n` +
       (criterio ? `Criterio de éxito acordado: ${criterio}\n` : '') +
@@ -115,7 +131,7 @@ async function arbitrar({ tema, criterio, propuestas }) {
     { role: 'system', content:
       'Sos el ÁRBITRO IMPARCIAL de un debate. No elegís ganador: mostrás la ESTRUCTURA del desacuerdo ' +
       'para que un humano decida rápido. Las propuestas vienen sin autor a propósito: juzgá el contenido. ' +
-      'Sé duro con las afirmaciones sin dato. Devolvés SOLO JSON válido, sin markdown.' },
+      'Sé duro con las afirmaciones sin dato. Devolvés SOLO JSON válido, sin markdown.' + ANTI_INVENCION },
     { role: 'user', content:
       `Tema: ${tema}\n${criterio ? `Criterio de éxito: ${criterio}\n` : ''}\nPropuestas:\n\n${cuerpo}\n\n` +
       'Devolvé JSON con exactamente estas claves:\n' +
