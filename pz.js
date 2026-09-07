@@ -22,6 +22,7 @@ const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
+const { readJSON, writeJSON, mutate, napMs } = require('./state');  // estado compartido con server.js: escritura honesta + sin perder updates
 const CFG = require('./config');                  // lee pz.config.json (repo, branch, etc.) — ver config.js
 const DIR = __dirname;
 const SESSIONS = path.join(DIR, 'sessions.json'); // sesiones vivas de Claude, por sessionId
@@ -39,13 +40,6 @@ const CLAIM_TTL_MS = 2 * 60 * 60 * 1000;   // un claim caduca a las 2h (red de s
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 const sh = (c, cwd) => { try { return execSync(c, { cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 8000 }).trim(); } catch { return ''; } };
-const readJSON = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return d; } };
-const writeJSON = (f, obj) => {
-  // escritura atómica: tmp + rename (varios procesos pz escriben a la vez)
-  const tmp = f + '.' + process.pid + '.tmp';
-  try { fs.writeFileSync(tmp, JSON.stringify(obj, null, 2)); fs.renameSync(tmp, f); }
-  catch { try { fs.unlinkSync(tmp); } catch {} }
-};
 const now = () => Date.now();
 const fresh = (iso, ttl) => iso && (now() - new Date(iso).getTime() < ttl);
 
@@ -94,15 +88,15 @@ function ctx(hook) {
 }
 
 function loadSessions() {
-  const all = readJSON(SESSIONS, {});
-  let changed = false;
-  for (const k of Object.keys(all)) if (!fresh(all[k].lastSeen, SESSION_TTL_MS)) { delete all[k]; changed = true; }
-  if (changed) writeJSON(SESSIONS, all);
-  return all;
+  return mutate(SESSIONS, {}, (all) => {
+    let changed = false;
+    for (const k of Object.keys(all)) if (!fresh(all[k].lastSeen, SESSION_TTL_MS)) { delete all[k]; changed = true; }
+    return changed ? all : null;
+  });
 }
 // upsert + latido. patch puede traer name/label.
 function heartbeat(c, patch = {}) {
-  const all = readJSON(SESSIONS, {});
+  return mutate(SESSIONS, {}, (all) => {
   const prev = all[c.sid] || {};
   all[c.sid] = {
     ...prev, // preserva campos extra (chatSeen, etc.)
@@ -115,8 +109,8 @@ function heartbeat(c, patch = {}) {
   };
   // prune stale de paso
   for (const k of Object.keys(all)) if (k !== c.sid && !fresh(all[k].lastSeen, SESSION_TTL_MS)) delete all[k];
-  writeJSON(SESSIONS, all);
-  return all[c.sid];
+  return all;
+  })[c.sid];
 }
 function myName(c) { const s = readJSON(SESSIONS, {})[c.sid]; return s && s.name; }
 function liveOthersInTop(top, sid) {
@@ -126,20 +120,22 @@ function liveOthersInTop(top, sid) {
 
 // ─── claims (archivos tomados) ────────────────────────────────────────────────
 function loadClaims() {
-  const all = readJSON(CLAIMS, {});
-  const live = loadSessions();
-  let changed = false;
-  for (const k of Object.keys(all)) {
-    const cl = all[k];
-    if (!fresh(cl.ts, CLAIM_TTL_MS) || !live[cl.sessionId]) { delete all[k]; changed = true; }
-  }
-  if (changed) writeJSON(CLAIMS, all);
-  return all;
+  const live = loadSessions();   // FUERA del lock de claims: nunca anidar dos locks
+  return mutate(CLAIMS, {}, (all) => {
+    let changed = false;
+    for (const k of Object.keys(all)) {
+      const cl = all[k];
+      if (!fresh(cl.ts, CLAIM_TTL_MS) || !live[cl.sessionId]) { delete all[k]; changed = true; }
+    }
+    return changed ? all : null;
+  });
 }
 function setClaim(absPath, c, opts = {}) {
-  const all = readJSON(CLAIMS, {});
-  all[canon(absPath)] = { sessionId: c.sid, name: myName(c) || 'sesión', ts: new Date().toISOString(), ...(opts.dir ? { dir: true } : {}) };
-  writeJSON(CLAIMS, all);
+  const name = myName(c) || 'sesión';   // lee SESSIONS antes de tomar el lock de CLAIMS
+  mutate(CLAIMS, {}, (all) => {
+    all[canon(absPath)] = { sessionId: c.sid, name, ts: new Date().toISOString(), ...(opts.dir ? { dir: true } : {}) };
+    return all;
+  });
 }
 function ownerOf(absPath, sid) {
   const all = loadClaims();
@@ -156,21 +152,22 @@ function ownerOf(absPath, sid) {
   return null;
 }
 function releaseClaims(sid, files) {
-  const all = readJSON(CLAIMS, {});
   let n = 0;
-  for (const k of Object.keys(all)) {
-    if (all[k].sessionId !== sid) continue;
-    if (files && files.length && !files.map(canon).includes(k)) continue;
-    delete all[k]; n++;
-  }
-  writeJSON(CLAIMS, all);
+  mutate(CLAIMS, {}, (all) => {
+    for (const k of Object.keys(all)) {
+      if (all[k].sessionId !== sid) continue;
+      if (files && files.length && !files.map(canon).includes(k)) continue;
+      delete all[k]; n++;
+    }
+    return n ? all : null;
+  });
   return n;
 }
 
 // ─── chat ──────────────────────────────────────────────────────────────────
 let counter = 0;
 function post({ from, type, text, files, branch }) {
-  const chat = readJSON(CHAT, []);
+  mutate(CHAT, [], (chat) => {
   chat.push({
     id: now() + '-' + (counter++), from: String(from).slice(0, 40),
     type: ['claim', 'done', 'warn', 'ask', 'note', 'join'].includes(type) ? type : 'note',
@@ -178,24 +175,39 @@ function post({ from, type, text, files, branch }) {
     files: files ? (Array.isArray(files) ? files : String(files).split(',')).map((s) => String(s).trim()).filter(Boolean).slice(0, 20) : [],
     branch: branch || null, ts: new Date().toISOString(),
   });
-  writeJSON(CHAT, chat.slice(-1000));
+  return chat.slice(-1000);
+  });
 }
 function markChatSeen(sid, ts) {
-  const all = readJSON(SESSIONS, {});
-  if (all[sid]) { all[sid].chatSeen = ts; writeJSON(SESSIONS, all); }
+  mutate(SESSIONS, {}, (all) => {
+    if (!all[sid]) return null;
+    all[sid].chatSeen = ts;
+    return all;
+  });
 }
-const sleep = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { execSync(`sleep ${Math.ceil(ms / 1000)}`); } };
+const sleep = napMs;
 // legacy: el server lee labels de registry.json por branch/cwd como fallback
 function saveLegacyLabel(c, patch) {
-  const reg = readJSON(REGISTRY, {});
-  const entry = { ...(reg[c.branch] || {}), ...patch, branch: c.branch, cwd: c.cwd, updatedAt: new Date().toISOString() };
-  if (c.branch && c.branch !== 'HEAD') reg[c.branch] = entry;
-  reg[c.cwd] = entry;
-  writeJSON(REGISTRY, reg);
+  mutate(REGISTRY, {}, (reg) => {
+    const entry = { ...(reg[c.branch] || {}), ...patch, branch: c.branch, cwd: c.cwd, updatedAt: new Date().toISOString() };
+    if (c.branch && c.branch !== 'HEAD') reg[c.branch] = entry;
+    reg[c.cwd] = entry;
+    return reg;
+  });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 const [cmd, ...rest] = process.argv.slice(2);
+
+// Si algo revienta (disco lleno, permisos, JSON ilegible): en los hooks callamos y
+// dejamos pasar —un hook nunca frena a la sesión—, pero en el uso interactivo se
+// muestra el error de verdad en vez de un "✓" que miente.
+const HOOK_CMDS = new Set(['guard', 'inbox', 'leave']);
+process.on('uncaughtException', (e) => {
+  if (HOOK_CMDS.has(cmd) || rest.includes('--for-hook')) process.exit(0);
+  console.error('✗ pz: ' + ((e && e.message) || e));
+  process.exit(1);
+});
 
 // ─── guard (hook PreToolUse) ─ árbitro: allow (exit 0) / deny (exit 2 + stderr)
 // FAIL-OPEN: ante cualquier duda/error, deja pasar. Sólo actúa dentro del repo configurado.
@@ -272,7 +284,7 @@ if (cmd === 'leave') {
   try {
     const c = ctx(hookInput());
     const n = releaseClaims(c.sid);
-    const all = readJSON(SESSIONS, {}); delete all[c.sid]; writeJSON(SESSIONS, all);
+    mutate(SESSIONS, {}, (all) => { if (!all[c.sid]) return null; delete all[c.sid]; return all; });
     if (process.stdout.isTTY) console.log(`✓ Saliste de la sala. Solté ${n} archivo(s) tomado(s).`);
   } catch {}
   process.exit(0);
@@ -388,6 +400,29 @@ if (cmd === 'claim') {
   }
   if (taken.length) { post({ from: name, type: 'claim', text: `tomo ${taken.length} archivo(s)/carpeta(s)`, files: taken, branch: c.branch }); console.log(`🔒 Tomaste: ${taken.join(', ')}`); }
   process.exit(0);
+}
+
+// ─── check ─ ¿puedo editar esto? Para agentes que NO tienen los hooks (a ellos
+// nadie los frena: preguntan antes de editar). exit 2 = ocupado, igual que el guard.
+if (cmd === 'check') {
+  const c = ctx({});
+  heartbeat(c);
+  const files = rest.flatMap((r) => r.split(',')).map((s) => s.trim()).filter(Boolean);
+  if (!files.length) { console.error('Decí qué archivos querés tocar. Ej: pz check src/a.js src/b.css'); process.exit(1); }
+  let blocked = 0;
+  for (const f of files) {
+    const abs = canon(path.resolve(c.cwd, f));
+    const owner = ownerOf(abs, c.sid);
+    if (owner) {
+      blocked++;
+      console.log(`⛔ ${f} — lo tiene "${owner.name}"` + (owner.dir ? ` (tomó la carpeta ${path.basename(owner.dirPath || '')}/)` : ''));
+    } else console.log(`✓ ${f} — libre`);
+  }
+  if (blocked) {
+    console.log('\nNo lo edites: coordiná por chat (pz say ask "…"), esperá a que lo suelte,');
+    console.log('o aislate en tu propia copia (pz isolate <tarea>).');
+  }
+  process.exit(blocked ? 2 : 0);
 }
 
 if (cmd === 'release') {
@@ -648,6 +683,7 @@ console.log(`pz — Sala de Sesiones${REPO_NAME ? ' · ' + REPO_NAME : ' (sin re
   pz say <claim|done|warn|ask|note> "<texto>" ["files"]
   pz ask [--wait] [--timeout N] "<pregunta>"   preguntar a la sala (--wait espera la respuesta)
   pz claim <archivos|carpetas...>       tomar (otras sesiones no podrán editarlos; carpeta = todo adentro)
+  pz check <archivos...>                ¿están libres? (exit 2 si no) — para agentes sin hooks
   pz release [archivos...]              soltarlos
   pz isolate [<slug>] [--carry]         crear tu worktree propio off main y mudarte (lleva .env y node_modules)
   pz board                              ver otras sesiones + chat

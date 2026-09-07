@@ -45,15 +45,9 @@ function sh(cmd, cwd = MAIN_REPO, opts = {}) {
     return opts.raw ? out : out.trim();
   }
 }
-// escritura atómica: tmp + rename (el server y los procesos pz escriben chat.json a la vez)
-function writeJSONAtomic(file, obj) {
-  const tmp = file + '.' + process.pid + '.tmp';
-  try { fs.writeFileSync(tmp, JSON.stringify(obj, null, 2)); fs.renameSync(tmp, file); }
-  catch { try { fs.unlinkSync(tmp); } catch {} }
-}
-function readJSON(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
-}
+// Estado compartido con pz.js: escritura atómica que TIRA si falla (nada de "✓" falso)
+// y mutate() con lock, porque el tablero/Telegram y las sesiones escriben chat.json a la vez.
+const { readJSON, writeJSON: writeJSONAtomic, mutate } = require('./state');
 function readChat() {
   const arr = readJSON(CHAT, []);
   return Array.isArray(arr) ? arr.slice(-200) : [];
@@ -227,7 +221,6 @@ setInterval(refresh, REFRESH_MS);
 let msgCounter = 0;
 function postMessage({ from, type, text, files, branch }) {
   if (!from || !text) return { ok: false, error: 'Falta nombre o texto.' };
-  const chat = readJSON(CHAT, []);
   const msg = {
     id: Date.now() + '-' + (msgCounter++),
     from: String(from).slice(0, 40),
@@ -237,8 +230,10 @@ function postMessage({ from, type, text, files, branch }) {
     branch: branch || null,
     ts: new Date().toISOString(),
   };
-  chat.push(msg);
-  writeJSONAtomic(CHAT, chat.slice(-1000));
+  // con lock: si Fede contesta desde el tablero justo cuando una sesión postea,
+  // antes se perdía uno de los dos mensajes.
+  try { mutate(CHAT, [], (chat) => { chat.push(msg); return chat.slice(-1000); }); }
+  catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
   return { ok: true, msg };
 }
 
@@ -400,9 +395,7 @@ function cleanWorktree(wtPath, branch) {
 // (para sobrevivir reinicios). Cap de 40 chars; vacío = sin owner (válido).
 function setOwner(v) {
   ownerName = String(v == null ? '' : v).trim().slice(0, 40);
-  const conf = readJSON(CONFIG.configPath, {});
-  conf.owner = ownerName;
-  writeJSONAtomic(CONFIG.configPath, conf);
+  mutate(CONFIG.configPath, {}, (conf) => { conf.owner = ownerName; return conf; });
   return ownerName;
 }
 
@@ -430,7 +423,8 @@ const server = http.createServer(async (req, res) => {
   if (req.url === '/api/chat') return json(200, { chat: readChat() });
   if (req.url === '/api/config' && req.method === 'POST') {
     let p = {}; try { p = JSON.parse(await body(req)); } catch {}
-    return json(200, { ok: true, owner: setOwner(p.owner) });
+    try { return json(200, { ok: true, owner: setOwner(p.owner) }); }
+    catch (e) { return json(500, { ok: false, error: (e && e.message) || String(e) }); }
   }
   if (req.url === '/api/say' && req.method === 'POST') {
     let p = {}; try { p = JSON.parse(await body(req)); } catch {}

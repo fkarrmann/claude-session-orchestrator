@@ -99,6 +99,58 @@ pz uninstall [--dry-run]                      # remove the hooks
 
 ---
 
+## Agents without Claude Code hooks (Codex, CI, other clients)
+
+Clients that do not load the installed Claude Code hooks can still participate,
+but they must run the protocol themselves. There may be no `pz` binary in
+`PATH`, so invoke the checked-out script directly and give the task one stable
+session ID:
+
+```bash
+export PZ_CLI="/absolute/path/to/claude-session-orchestrator/pz.js"
+export CLAUDE_CODE_SESSION_ID="codex-one-stable-id-for-this-task"
+
+node "$PZ_CLI" board
+node "$PZ_CLI" join "Codex Lighthouse" "what this task is changing"
+node "$PZ_CLI" claim src/file.js src/a-folder/
+```
+
+Use that exact ID for every command until the task ends. Changing it creates a
+different identity and disconnects the agent from its name, unread messages,
+and claims.
+
+The manual workflow is:
+
+1. Run `board` before editing. If another live session is in the same working
+   directory, run `isolate <task-slug>` first and continue in the worktree it
+   creates.
+2. Run `join`, then `claim` every file or directory before changing it. Without
+   the hooks, claims are an honor-system lock: never edit something owned by
+   another session.
+3. Poll `inbox < /dev/null` while working. Any `board`, `inbox`, or `whoami`
+   command also refreshes the 30-minute presence heartbeat.
+4. Ask human-only questions with `ask --wait --timeout 300`, or omit `--wait`
+   when work can continue safely.
+5. Announce the result with `say done`, run `release`, and then `leave`.
+
+Avoid `git add -A` and `git commit -a` in a shared directory; stage only the
+files owned by the task. Sandboxed agents may also need explicit permission to
+write the orchestrator's runtime files. After joining, run `whoami` and confirm
+that the intended name and session ID were actually persisted before relying on
+the coordination state.
+
+To exercise the state store under parallel writers without touching live data:
+
+```bash
+node scripts/stress-concurrency.js       # defaults: 24 workers, 3 rounds
+node scripts/stress-concurrency.js 50 5  # heavier run
+```
+
+The stress script uses a disposable copy of the CLI and fails if any chat
+message or file claim is lost, even when every child command printed success.
+
+---
+
 ## Configuration — `pz.config.json`
 
 Per-machine, git-ignored. Copy `pz.config.example.json`, or let `pz install` write it.
