@@ -29,7 +29,6 @@ const DIR = __dirname;
 const SESSIONS = path.join(DIR, 'sessions.json'); // sesiones vivas de Claude, por sessionId
 const CLAIMS = path.join(DIR, 'claims.json');     // archivos tomados, por path absoluto
 const CHAT = path.join(DIR, 'chat.json');
-const REGISTRY = path.join(DIR, 'registry.json'); // legacy: labels por branch/cwd (el server lo lee de fallback)
 const MAIN_REPO = CFG.repo;                       // repo cuyos worktrees se orquestan
 const MAIN_BRANCH = CFG.mainBranch;               // rama principal (isolate parte de origin/<MAIN_BRANCH>)
 const REPO_NAME = CFG.repoName;                   // basename — para el descarte rápido del guard
@@ -267,16 +266,6 @@ function markChatSeen(sid, ts) {
   });
 }
 const sleep = napMs;
-// legacy: el server lee labels de registry.json por branch/cwd como fallback
-function saveLegacyLabel(c, patch) {
-  mutate(REGISTRY, {}, (reg) => {
-    const entry = { ...(reg[c.branch] || {}), ...patch, branch: c.branch, cwd: c.cwd, updatedAt: new Date().toISOString() };
-    if (c.branch && c.branch !== 'HEAD') reg[c.branch] = entry;
-    reg[c.cwd] = entry;
-    return reg;
-  });
-}
-
 // --flag "valor" → devuelve el valor y lo SACA de args (los subcomandos usan posicionales)
 function takeFlag(args, flag, max = 40) {
   const i = args.indexOf(flag);
@@ -457,7 +446,6 @@ if (cmd === 'join') {
   const what = rest.slice(1).join(' ').trim();
   if (!name) { console.error('Falta el nombre. Ej: pz join "Sinapsis" "armando la sala de chat"'); process.exit(1); }
   const me = heartbeat(c, { name, ...(what ? { label: what } : {}) });
-  saveLegacyLabel(c, { sessionName: name, ...(what ? { label: what } : {}) });
   post({ from: name, type: 'join', text: what ? `me sumo — ${what}` : 'me sumo a la sala', branch: me.branch });
   const others = liveOthersInTop(me.top, c.sid);
   console.log(`✓ Sos "${name}"${me.branch ? ` en [${me.branch}]` : ''}${what ? ` — ${what}` : ''}`);

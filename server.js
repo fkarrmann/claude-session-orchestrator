@@ -29,7 +29,6 @@ const PZ_SCRIPT = CONFIG.pzScript;    // ruta a pz.js — para disparar la gener
 let bitGenerating = false;            // candado: una generación a la vez (evita solaparse)
 const escRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const REFRESH_MS = 8000;   // re-escaneo de git en background
-const REGISTRY = path.join(__dirname, 'registry.json'); // identidad por worktree (nombre+label) — legacy/fallback
 const CHAT = path.join(__dirname, 'chat.json');          // línea de tiempo de mensajes
 const SESSIONS = path.join(__dirname, 'sessions.json');  // sesiones VIVAS de Claude (por sessionId) — el modelo real
 const CLAIMS = path.join(__dirname, 'claims.json');      // archivos tomados (por path absoluto)
@@ -101,7 +100,6 @@ function gather() {
   // copia local vieja de origin/main — casi siempre es un stat de FETCH_HEAD y nada más
   STALENESS.ensureFreshBase(MAIN_REPO);
   resolveBaseRef();
-  const registry = readJSON(REGISTRY, {});
   const roomSessions = Object.values(readRoomSessions());
   const worktrees = parseWorktrees();
 
@@ -152,12 +150,13 @@ function gather() {
     const cleanable = kind !== 'main' && !dirty && (isMerged || upstreamGone || (ahead === 0 && kind === 'auto'));
     const touched = [...dirtyFiles];
 
-    const reg = registry[branch] || registry[cwd] || null;
-    // Identidad: preferir las sesiones de acá (vivas antes que en pausa); fallback al registry legacy.
+    // Identidad: SÓLO las sesiones que están acá (vivas antes que en pausa). Ya no se cae al
+    // registry legacy: con nombres que duran 24h, ese respaldo sólo mostraba fantasmas
+    // ("Red doble salida" como dueña de los restos de la carpeta principal).
     const liveNamed = here.filter((s) => s.name && !s.paused);
     const named = here.filter((s) => s.name);
-    const sessionName = (named[0] && named[0].name) || (reg && reg.sessionName) || null;
-    const label = (named[0] && named[0].label) || (reg && reg.label) || null;
+    const sessionName = (named[0] && named[0].name) || null;
+    const label = (named[0] && named[0].label) || null;
     return {
       path: cwd, name: path.basename(cwd), kind, branch, detached: w.detached, exists,
       dirtyCount: dirtyFiles.length, stagedCount, ahead, behind, lastSubject, lastRel, lastIso, upstreamGone,
@@ -183,15 +182,17 @@ function gather() {
     .map((s) => ({ path: s.path, branch: s.branch, main: s.kind === 'main', names: awake(s).map((x) => x.name) }));
   for (const s of sessions) if (s.multiSession) s.colliding = true;
 
-  // Colisiones: mismo archivo sin guardar en 2+ sesiones activas
+  // Colisiones: mismo archivo sin guardar en 2+ sesiones activas. Sin sesión adentro, la
+  // carpeta se nombra por lo que es (la principal no es de nadie).
+  const ownerLabel = (s) => s.sessionName || (s.kind === 'main' ? 'carpeta principal' : s.name);
   const fileOwners = {};
   for (const s of sessions.filter((x) => x.isActive)) for (const f of s.touched) (fileOwners[f] = fileOwners[f] || []).push(s);
   const collisions = Object.entries(fileOwners)
     .filter(([, o]) => new Set(o.map((s) => s.path)).size > 1)
-    .map(([file, o]) => ({ file, owners: Array.from(new Set(o.map((s) => s.sessionName || s.name))) }))
+    .map(([file, o]) => ({ file, owners: Array.from(new Set(o.map(ownerLabel))) }))
     .sort((a, b) => b.owners.length - a.owners.length);
   const colliding = new Set();
-  for (const c of collisions) for (const s of sessions.filter((x) => x.isActive)) if (c.owners.includes(s.sessionName || s.name)) colliding.add(s.path);
+  for (const c of collisions) for (const s of sessions.filter((x) => x.isActive)) if (c.owners.includes(ownerLabel(s))) colliding.add(s.path);
   for (const s of sessions) s.colliding = colliding.has(s.path) || !!s.multiSession;
 
   return {
