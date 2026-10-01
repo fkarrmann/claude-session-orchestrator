@@ -34,6 +34,7 @@ const CHAT = path.join(__dirname, 'chat.json');          // línea de tiempo de 
 const SESSIONS = path.join(__dirname, 'sessions.json');  // sesiones VIVAS de Claude (por sessionId) — el modelo real
 const CLAIMS = path.join(__dirname, 'claims.json');      // archivos tomados (por path absoluto)
 const SESSION_TTL_MS = 30 * 60 * 1000;                    // una sesión se considera viva 30' tras su último latido
+const SESSION_KEEP_MS = 24 * 60 * 60 * 1000;              // …y "en pausa" hasta 24h: sigue abierta en la app, sólo quieta
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 function sh(cmd, cwd = MAIN_REPO, opts = {}) {
@@ -53,13 +54,15 @@ function readChat() {
   return Array.isArray(arr) ? arr.slice(-200) : [];
 }
 function canon(p) { try { return fs.realpathSync(p); } catch { return p; } }
-// Sesiones de Claude vivas (latido < TTL). Devuelve {sessionId: {...}}.
-function readLiveSessions() {
+// Sesiones de Claude de la sala: vivas (latido < 30') y en pausa (< 24h, marcadas paused).
+// Las en pausa se muestran (con su nombre) pero no disparan alarmas. Devuelve {sessionId: {...}}.
+function readRoomSessions() {
   const all = readJSON(SESSIONS, {});
   const out = {};
   for (const k of Object.keys(all)) {
     const s = all[k];
-    if (s && s.lastSeen && (Date.now() - new Date(s.lastSeen).getTime() < SESSION_TTL_MS)) out[k] = s;
+    const age = s && s.lastSeen ? Date.now() - new Date(s.lastSeen).getTime() : Infinity;
+    if (age < SESSION_KEEP_MS) out[k] = { ...s, paused: age >= SESSION_TTL_MS };
   }
   return out;
 }
@@ -99,7 +102,7 @@ function gather() {
   STALENESS.ensureFreshBase(MAIN_REPO);
   resolveBaseRef();
   const registry = readJSON(REGISTRY, {});
-  const liveSessions = Object.values(readLiveSessions());
+  const roomSessions = Object.values(readRoomSessions());
   const worktrees = parseWorktrees();
 
   const prByBranch = {};
@@ -137,9 +140,9 @@ function gather() {
       lastSubject = parts[0] || ''; lastRel = parts[1] || ''; lastIso = parts[2] || '';
       if (branch && sh(`git for-each-ref --format='%(upstream:track)' refs/heads/${branch}`, cwd).includes('gone')) upstreamGone = true;
     }
-    // Sesiones de Claude vivas que están EN este worktree (mismo toplevel).
+    // Sesiones de Claude que están EN este worktree (mismo toplevel): vivas primero, después las en pausa.
     const top = canon(cwd);
-    const here = liveSessions.filter((s) => canon(s.top || s.cwd || '') === top);
+    const here = roomSessions.filter((s) => canon(s.top || s.cwd || '') === top).sort((a, b) => a.paused - b.paused);
 
     const pr = branch ? prByBranch[branch] : null;
     const isMerged = branch ? (merged.has(branch) || (pr && pr.state === 'MERGED')) : false;
@@ -150,10 +153,11 @@ function gather() {
     const touched = [...dirtyFiles];
 
     const reg = registry[branch] || registry[cwd] || null;
-    // Identidad: preferir las sesiones VIVAS acá; fallback al registry legacy.
-    const liveNamed = here.filter((s) => s.name);
-    const sessionName = (liveNamed[0] && liveNamed[0].name) || (reg && reg.sessionName) || null;
-    const label = (liveNamed[0] && liveNamed[0].label) || (reg && reg.label) || null;
+    // Identidad: preferir las sesiones de acá (vivas antes que en pausa); fallback al registry legacy.
+    const liveNamed = here.filter((s) => s.name && !s.paused);
+    const named = here.filter((s) => s.name);
+    const sessionName = (named[0] && named[0].name) || (reg && reg.sessionName) || null;
+    const label = (named[0] && named[0].label) || (reg && reg.label) || null;
     return {
       path: cwd, name: path.basename(cwd), kind, branch, detached: w.detached, exists,
       dirtyCount: dirtyFiles.length, stagedCount, ahead, behind, lastSubject, lastRel, lastIso, upstreamGone,
@@ -162,20 +166,21 @@ function gather() {
       pr: pr ? { number: pr.number, state: pr.state, url: pr.url, draft: pr.isDraft } : null,
       isMerged, isActive, cleanable, touched,
       sessionName, label,
-      liveSessions: here.map((s) => ({ name: s.name || null, sessionId: s.sessionId, label: s.label || null, lastSeen: s.lastSeen })),
-      // sólo las sesiones PRESENTADAS cuentan para la alarma: una recién abierta
-      // (heartbeat del hook de arranque, sin join todavía) no es riesgo real aún
+      liveSessions: here.map((s) => ({ name: s.name || null, sessionId: s.sessionId, label: s.label || null, lastSeen: s.lastSeen, paused: !!s.paused, auto: !!s.autoName })),
+      // sólo las sesiones VIVAS cuentan para la alarma (una en pausa no está escribiendo).
+      // Desde que toda sesión nace con nombre automático, cuentan aunque no hayan hecho join.
       multiSession: liveNamed.length >= 2,
     };
   });
 
-  // Un worktree con sesiones de Claude vivas adentro cuenta como activo.
+  // Un worktree con sesiones de Claude adentro (vivas o en pausa) cuenta como activo.
   for (const s of sessions) if (s.liveSessions && s.liveSessions.length) s.isActive = true;
 
-  // ⛔ EL peligro central: 2+ sesiones de Claude en el MISMO directorio → commits enredados.
+  // ⛔ EL peligro central: 2+ sesiones de Claude VIVAS en el MISMO directorio → commits enredados.
+  const awake = (s) => (s.liveSessions || []).filter((x) => x.name && !x.paused);
   const sharedDirs = sessions
-    .filter((s) => s.liveSessions && s.liveSessions.filter((x) => x.name).length >= 2)
-    .map((s) => ({ path: s.path, branch: s.branch, names: s.liveSessions.filter((x) => x.name).map((x) => x.name) }));
+    .filter((s) => awake(s).length >= 2)
+    .map((s) => ({ path: s.path, branch: s.branch, main: s.kind === 'main', names: awake(s).map((x) => x.name) }));
   for (const s of sessions) if (s.multiSession) s.colliding = true;
 
   // Colisiones: mismo archivo sin guardar en 2+ sesiones activas
@@ -546,6 +551,7 @@ const HTML = /* html */ `<!doctype html>
   .msg{display:flex;flex-direction:column;gap:5px;max-width:860px}
   .msg-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
   .chip{font-size:11.5px;font-weight:700;padding:2px 10px;border-radius:20px;border:1px solid;white-space:nowrap}
+  .chip.paused{opacity:.45;border-style:dashed}
   .mtype{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:2px 8px;border-radius:6px;border:1px solid var(--pz-border);color:var(--pz-muted)}
   .mtype.claim{color:var(--pz-amber);border-color:rgba(240,136,62,.35);background:rgba(240,136,62,.08)}
   .mtype.done{color:var(--pz-green);border-color:rgba(76,195,138,.35);background:rgba(76,195,138,.08)}
@@ -723,8 +729,8 @@ const HTML = /* html */ `<!doctype html>
 const esc=(s)=>(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 // chip de color ESTABLE derivado del nombre — la identidad de cada sesión
 function hueOf(name){let h=0;const s=name||'?';for(let i=0;i<s.length;i++)h=(h*31+s.charCodeAt(i))>>>0;return h%360;}
-function chip(name){if(!name)return '';const h=hueOf(name);
-  return '<span class="chip" style="background:hsl('+h+',55%,18%);border-color:hsl('+h+',60%,42%);color:hsl('+h+',75%,72%)">'+esc(name)+'</span>';}
+function chip(name,paused){if(!name)return '';const h=hueOf(name);
+  return '<span class="chip'+(paused?' paused':'')+'"'+(paused?' title="en pausa: abierta pero sin actividad hace más de 30 min"':'')+' style="background:hsl('+h+',55%,18%);border-color:hsl('+h+',60%,42%);color:hsl('+h+',75%,72%)">'+esc(name)+'</span>';}
 function fmtTime(iso){const d=new Date(iso),now=new Date();const diff=(now-d)/1000;
   const hm=d.toLocaleTimeString('es-AR',{hour:'2-digit',minute:'2-digit',hour12:false});
   let rel; if(diff<60)rel='recién'; else if(diff<3600)rel='hace '+Math.floor(diff/60)+'m';
@@ -751,10 +757,12 @@ const pill=(t,k)=>'<span class="pill'+(k?' '+k:'')+'">'+esc(String(t))+'</span>'
 let atBottom=true;
 function renderPresence(sessions){
   const el=document.getElementById('presence');const names=[];
-  for(const s of sessions||[])for(const l of (s.liveSessions||[]))if(l.name&&!names.includes(l.name))names.push(l.name);
+  const paused={};
+  for(const s of sessions||[])for(const l of (s.liveSessions||[]))if(l.name&&!names.includes(l.name)){names.push(l.name);paused[l.name]=!!l.paused;}
   if(!names.length){el.style.display='none';el.innerHTML='';return;}
+  names.sort((a,b)=>paused[a]-paused[b]);
   el.style.display='flex';
-  el.innerHTML='<span class="presence-lbl">'+ic('people')+'En la sala</span>'+names.map(chip).join('');
+  el.innerHTML='<span class="presence-lbl">'+ic('people')+'En la sala</span>'+names.map(n=>chip(n,paused[n])).join('');
 }
 
 // ── Owner (tu nombre): editable inline desde el header ──
@@ -824,10 +832,10 @@ function sessionRow(s){
   const cls=['s-row',s.kind];if(s.isActive)cls.push('active');if(s.colliding)cls.push('colliding');
   const pills=[];
   if(s.liveSessions&&s.liveSessions.length){
-    const named=s.liveSessions.filter(x=>x.name).length, anon=s.liveSessions.length-named;
-    let txt=named?(named+' sesión'+(named>1?'es':'')):'';
-    if(anon)txt+=(txt?' · ':'')+anon+' s/present.';
-    pills.push(pill(txt,named>=2?'red':'green'));
+    const awake=s.liveSessions.filter(x=>!x.paused).length, asleep=s.liveSessions.length-awake;
+    let txt=awake?(awake+' sesión'+(awake>1?'es':'')):'';
+    if(asleep)txt+=(txt?' · ':'')+asleep+' en pausa';
+    pills.push(pill(txt,awake>=2?'red':(awake?'green':'dim')));
   }
   pills.push(s.dirtyCount>0?pill(s.dirtyCount+' sin guardar','amber'):pill('limpio','dim'));
   if(s.stagedCount>0)pills.push(pill(s.stagedCount+' en cola','amber'));
@@ -837,10 +845,11 @@ function sessionRow(s){
   if(s.isMerged)pills.push(pill('mergeado','purple'));
   if(s.upstreamGone)pills.push(pill('remoto borrado','red'));
   pills.push(prPill(s.pr));
-  const head=(s.sessionName?chip(s.sessionName):'<span class="s-name">'+esc(s.name)+'</span>')+'<span class="s-kind">'+esc(s.kind)+'</span>';
+  const ls=(s.liveSessions||[]).filter(x=>x.name);
+  const head=(ls.length?ls.map(x=>chip(x.name,x.paused)).join(' '):(s.sessionName?chip(s.sessionName):'<span class="s-name">'+esc(s.name)+'</span>'))+'<span class="s-kind">'+esc(s.kind==='main'?'carpeta principal':s.kind)+'</span>';
   const body=s.label?'<div class="s-label">'+esc(s.label)+'</div>':(s.lastSubject?'<div class="s-sub">'+esc(s.lastSubject)+'</div>':'<div class="s-sub">sin commits</div>');
   const branch=s.branch?'<span class="s-branch">'+esc(s.branch)+'</span>':'<span class="s-branch detached">detached</span>';
-  const note=s.multiSession?'<div class="s-note">2+ sesiones de Claude en este dir — riesgo de commit enredado (que se aíslen: pz isolate)</div>':(s.colliding?'<div class="s-note">comparte archivos sin guardar con otra sesión</div>':'');
+  const note=s.multiSession?'<div class="s-note">2+ sesiones de Claude en este dir — riesgo de commit enredado ('+(s.kind==='main'?'que se aíslen: pz isolate':'que una siga en una sesión nueva de la app')+')</div>':(s.colliding?'<div class="s-note">comparte archivos sin guardar con otra sesión</div>':'');
   return '<div class="'+cls.join(' ')+'"><div class="s-top">'+head+'</div>'+branch+body+'<div class="s-pills">'+pills.filter(Boolean).join('')+'</div>'+note+'</div>';
 }
 function cleanCard(s){const reason=s.isMerged?'mergeado a main':s.upstreamGone?'remoto borrado':'worktree sin trabajo propio';
@@ -869,7 +878,7 @@ function renderState(d){
   const dn=document.getElementById('danger');
   if(d.sharedDirs&&d.sharedDirs.length){
     dn.className='danger-strip';
-    dn.innerHTML=ic('danger',null,16)+'<span><b>'+d.sharedDirs.length+' directorio'+(d.sharedDirs.length>1?'s':'')+' con 2+ sesiones de Claude</b> — riesgo de commit enredado. Que cada una se aísle: <code>pz isolate &lt;tarea&gt;</code></span>';
+    dn.innerHTML=ic('danger',null,16)+'<span><b>'+d.sharedDirs.length+' directorio'+(d.sharedDirs.length>1?'s':'')+' con 2+ sesiones de Claude</b> — riesgo de commit enredado. '+(d.sharedDirs.some(x=>x.main)?'Desde la carpeta principal: <code>pz isolate &lt;tarea&gt;</code>; en otra carpeta: que una siga en una sesión nueva de la app.':'Que una de cada par siga en una sesión nueva de la app (nace en su propio worktree).')+'</span>';
   }else{dn.className='';dn.innerHTML='';}
   const ss=d.sessions.slice().sort((a,b)=>{const rk=(s)=>(s.colliding?0:1)*100+(s.isActive?0:1)*10+({named:0,main:1,tmp:2,auto:3,other:4}[s.kind]||5);return rk(a)-rk(b)||b.ahead-a.ahead;});
   const active=ss.filter(s=>s.isActive||s.kind==='named'||s.kind==='main');
@@ -878,7 +887,7 @@ function renderState(d){
   let h='';
   if(d.sharedDirs&&d.sharedDirs.length){h+='<div class="sec bad">'+ic('danger')+'2+ sesiones en el mismo dir</div><div class="danger-box">'
     +d.sharedDirs.map(x=>'<div class="danger-row"><code style="color:var(--pz-red)">'+esc(x.branch||x.path)+'</code><span class="who">'+x.names.map(esc).join(' · ')+'</span></div>').join('')
-    +'</div><div class="hint">Cada sesión debería aislarse en su worktree: <code>pz isolate &lt;tarea&gt;</code></div>';}
+    +'</div><div class="hint">Cada sesión tiene que estar en su propio worktree (la app le da uno a cada sesión nueva; desde la carpeta principal: <code>pz isolate &lt;tarea&gt;</code>).</div>';}
   if(d.collisions.length){h+='<div class="sec">Colisiones — mismo archivo en 2+ sesiones</div><div class="danger-box">'
     +d.collisions.map(x=>'<div class="danger-row"><code>'+esc(x.file)+'</code><span class="who">'+x.owners.map(esc).join(' · ')+'</span></div>').join('')+'</div>';}
   h+='<div class="sec">Sesiones activas</div>'+(active.length?active.map(sessionRow).join(''):'<div class="empty">Sin trabajo en curso.</div>');

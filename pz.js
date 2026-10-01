@@ -11,8 +11,9 @@
  *   pz ask [--wait] [--timeout N] "<q>"   preguntar a la sala; --wait espera la respuesta
  *   pz claim <archivos|carpetas...>       tomar (carpeta = todo lo de adentro)
  *   pz release [archivos...]              soltar archivos (todos si no se especifica)
- *   pz isolate [<slug>] [--carry]         crear tu propio worktree off main y mudarte ahí
+ *   pz isolate [<slug>] [--carry <archivos>]  (sólo desde la carpeta principal) worktree propio off main
  *   pz board [--for-hook]                 ver sesiones + colisiones + chat
+ *   pz chat [N]                           sólo la sala (últimos N mensajes)
  *   pz whoami                             tu identidad
  *   pz leave                              salir de la sala (libera tus claims) — lo corre el hook SessionEnd
  *   pz guard                              árbitro de hooks PreToolUse (Edit/Write/Bash) — uso interno
@@ -36,6 +37,11 @@ const PZ_SCRIPT = CFG.pzScript;                   // ruta a este pz.js — para 
 const ENV_DIRS = CFG.envDirs;                     // dirs cuyos .env* copia `pz isolate` al worktree nuevo
 
 const SESSION_TTL_MS = 30 * 60 * 1000;     // una sesión se considera viva 30' tras su último latido
+// …y "en pausa" (se la sigue mostrando, con su nombre) hasta 24h sin latido: una sesión
+// de la app puede quedar quieta horas sin estar cerrada. Antes se borraba a los 30' y
+// volvía sin nombre — así fue como "Visualización de informes de cancha" nunca apareció.
+const SESSION_KEEP_MS = 24 * 60 * 60 * 1000;
+const TITLE_RECHECK_MS = 60 * 1000;        // cada cuánto buscar el título de una sesión que todavía no lo tiene
 const CLAIM_TTL_MS = 2 * 60 * 60 * 1000;   // un claim caduca a las 2h (red de seguridad)
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -52,6 +58,9 @@ function canon(p) {
   return abs;
 }
 function toplevelOf(cwd) { return canon(sh('git rev-parse --show-toplevel', cwd) || cwd); }
+// La carpeta principal del repo: ahí no trabaja nadie (la app le da a cada sesión su worktree).
+const MAIN_TOP = MAIN_REPO ? canon(MAIN_REPO) : null;
+const isMainFolder = (top) => !!MAIN_TOP && top === MAIN_TOP;
 function commonDirOf(cwd) { const d = sh('git rev-parse --git-common-dir', cwd); return d ? canon(path.resolve(cwd, d)) : null; }
 // Cortocircuito barato (sin git): la enorme mayoría de las invocaciones del hook
 // son en OTROS proyectos → descartarlas por prefijo de path antes de tocar git.
@@ -87,29 +96,94 @@ function ctx(hook) {
   return { sid, cwd, top: toplevelOf(cwd), branch: sh('git rev-parse --abbrev-ref HEAD', cwd) || null };
 }
 
+// Devuelve sólo las sesiones VIVAS (latido < 30'). Las que están en pausa quedan
+// guardadas hasta 24h pero no cuentan para frenos, claims ni alarmas.
 function loadSessions() {
-  return mutate(SESSIONS, {}, (all) => {
+  const all = mutate(SESSIONS, {}, (all) => {
     let changed = false;
-    for (const k of Object.keys(all)) if (!fresh(all[k].lastSeen, SESSION_TTL_MS)) { delete all[k]; changed = true; }
+    for (const k of Object.keys(all)) if (!fresh(all[k].lastSeen, SESSION_KEEP_MS)) { delete all[k]; changed = true; }
     return changed ? all : null;
   });
+  return Object.fromEntries(Object.entries(all).filter(([, s]) => fresh(s.lastSeen, SESSION_TTL_MS)));
 }
-// upsert + latido. patch puede traer name/label.
-function heartbeat(c, patch = {}) {
+
+// El título que la app (o /rename) le puso a la sesión. Claude Code lo anota en el
+// registro de la conversación como {"type":"custom-title","customTitle":"…"}; vale el
+// último. Sin registro o sin título todavía (la app lo pone tras el primer mensaje) → null.
+function sessionTitle(transcript) {
+  if (!transcript) return null;
+  let txt; try { txt = fs.readFileSync(transcript, 'utf8'); } catch { return null; }
+  for (let i = txt.lastIndexOf('"custom-title"'); i >= 0;) {
+    const a = txt.lastIndexOf('\n', i) + 1, b = txt.indexOf('\n', i);
+    try { const t = String(JSON.parse(txt.slice(a, b < 0 ? undefined : b)).customTitle || '').trim(); if (t) return t.slice(0, 40); } catch {}
+    if (a === 0) break;
+    i = txt.lastIndexOf('"custom-title"', a - 1);
+  }
+  return null;
+}
+// Nombre por defecto mientras no haya título: la rama, sin el prefijo de la herramienta.
+function defaultName(loc) {
+  const b = loc.branch && loc.branch !== 'HEAD' ? loc.branch.replace(/^(claude|pz|feat|feature|fix|chore)\//, '') : '';
+  return (b || path.basename(loc.top || loc.cwd || '') || 'sesión').slice(0, 40);
+}
+// Los nombres son la dirección de la sala (--to): dos sesiones no pueden compartirlo.
+function uniqueName(all, sid, base) {
+  const taken = new Set(Object.values(all).filter((s) => s.sessionId !== sid && s.name).map((s) => s.name));
+  if (!taken.has(base)) return base;
+  for (let n = 2; ; n++) { const cand = `${base.slice(0, 35)} (${n})`; if (!taken.has(cand)) return cand; }
+}
+
+// upsert + latido. patch: name/label (join), move + isolatedTo (isolate).
+// hook: el JSON del hook, que trae el registro de la conversación (de ahí sale el título).
+// Toda sesión queda con nombre: el que eligió con `pz join` o uno automático
+// (título de la app, o la rama mientras no tenga título). El automático nunca pisa al elegido.
+function heartbeat(c, patch = {}, hook = null) {
+  const before = readJSON(SESSIONS, {})[c.sid] || {};
+  const transcript = (hook && hook.transcript_path) || before.transcript || null;
+  const auto = !patch.name && (!before.name || before.autoName);
+  // leer el título fuera del lock (el registro puede pesar varios MB); los hooks de
+  // herramientas lo buscan a lo sumo una vez por minuto, y ya encontrado, cada 10'
+  const lastCheck = before.titleCheckedAt ? now() - new Date(before.titleCheckedAt).getTime() : Infinity;
+  const atTurn = !!hook && ['SessionStart', 'UserPromptSubmit'].includes(hook.hook_event_name);   // arranque o mensaje nuevo: buscar siempre
+  const checkTitle = auto && !!transcript && (atTurn || lastCheck > (before.titled ? 10 * TITLE_RECHECK_MS : TITLE_RECHECK_MS));
+  const title = checkTitle ? sessionTitle(transcript) : null;
+  // Una sesión aislada sigue reportando su carpeta de ARRANQUE en cada hook: si no, cada
+  // latido la "mudaba" de vuelta (le pasó a "Canchas al mapa", que figuraba en la carpeta
+  // principal trabajando en /tmp/pz-canchas).
+  let loc = { cwd: c.cwd, top: c.top, branch: c.branch };
+  if (patch.move) loc = patch.move;
+  else if (before.isolatedTo && before.top === before.isolatedTo && c.top !== before.isolatedTo && c.top === before.home)
+    loc = { cwd: before.cwd, top: before.top, branch: sh('git rev-parse --abbrev-ref HEAD', before.top) || before.branch };
+  const inRepo = before.inRepo && loc.top === before.top ? true : inPzRepo(loc.cwd);
   return mutate(SESSIONS, {}, (all) => {
-  const prev = all[c.sid] || {};
-  all[c.sid] = {
-    ...prev, // preserva campos extra (chatSeen, etc.)
-    sessionId: c.sid,
-    name: patch.name || prev.name || null,
-    label: patch.label !== undefined ? patch.label : (prev.label || null),
-    cwd: c.cwd, top: c.top, branch: c.branch,
-    startedAt: prev.startedAt || new Date().toISOString(),
-    lastSeen: new Date().toISOString(),
-  };
-  // prune stale de paso
-  for (const k of Object.keys(all)) if (k !== c.sid && !fresh(all[k].lastSeen, SESSION_TTL_MS)) delete all[k];
-  return all;
+    const prev = all[c.sid] || {};
+    let name = prev.name || null, autoName = !!prev.autoName, titled = !!prev.titled;
+    if (patch.name) { name = patch.name; autoName = false; titled = false; }
+    else if (!name || autoName) {
+      autoName = true;
+      if (title) { name = title === name ? name : uniqueName(all, c.sid, title); titled = true; }
+      else if (!titled) {
+        const base = defaultName(loc);
+        if (!(name && (name === base || name.startsWith(base.slice(0, 35) + ' (')))) name = uniqueName(all, c.sid, base);
+      }
+    }
+    all[c.sid] = {
+      ...prev, // preserva campos extra (chatSeen, etc.)
+      sessionId: c.sid,
+      name, autoName, titled,
+      label: patch.label !== undefined ? patch.label : (prev.label || null),
+      cwd: loc.cwd, top: loc.top, branch: loc.branch,
+      home: prev.home || c.top,                                    // dónde arrancó
+      ...(patch.isolatedTo ? { isolatedTo: patch.isolatedTo } : {}),
+      inRepo,
+      transcript: transcript || prev.transcript || null,
+      ...(checkTitle ? { titleCheckedAt: new Date().toISOString() } : {}),
+      startedAt: prev.startedAt || new Date().toISOString(),
+      lastSeen: new Date().toISOString(),
+    };
+    // prune de paso: sólo lo que lleva más de 24h sin dar señales
+    for (const k of Object.keys(all)) if (k !== c.sid && !fresh(all[k].lastSeen, SESSION_KEEP_MS)) delete all[k];
+    return all;
   })[c.sid];
 }
 function myName(c) { const s = readJSON(SESSIONS, {})[c.sid]; return s && s.name; }
@@ -179,6 +253,12 @@ function post({ from, type, text, files, branch, to }) {
   return chat.slice(-1000);
   });
 }
+// Una línea de la sala. SIEMPRE con el destinatario: sin él, dos avisos seguidos del mismo
+// autor a dos sesiones distintas se leían como el mismo mensaje repetido.
+function fmtMsg(m, meName) {
+  const t = new Date(m.ts).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' });
+  return `[${t}] ${m.from}${m.to ? ` → ${m.to === meName ? 'VOS' : m.to}` : ''} (${m.type}): ${m.text}`;
+}
 function markChatSeen(sid, ts) {
   mutate(SESSIONS, {}, (all) => {
     if (!all[sid]) return null;
@@ -228,7 +308,7 @@ if (cmd === 'guard') {
     if (!maybePz(cwd0)) process.exit(0);     // descarte rápido sin git (otros proyectos)
     const c = ctx(hook);
     if (!inPzRepo(c.cwd)) process.exit(0);   // fuera del repo configurado: no tocar nada
-    heartbeat(c);                            // latido (así otras sesiones me "ven" acá)
+    heartbeat(c, {}, hook);                  // latido (así otras sesiones me "ven" acá)
 
     const tool = hook.tool_name;
     const ti = hook.tool_input || {};
@@ -309,14 +389,14 @@ if (cmd === 'inbox') {
     if (!maybePz(cwd0)) process.exit(0);
     const c = ctx(hook);
     if (!inPzRepo(c.cwd)) process.exit(0);
-    const me = heartbeat(c);
+    const me = heartbeat(c, {}, hook);
     const chat = readJSON(CHAT, []);
     if (!chat.length) process.exit(0);
     const seen = new Date(me.chatSeen || me.startedAt).getTime();
     const news = chat.filter((m) => new Date(m.ts).getTime() > seen && m.from !== me.name);
     if (!news.length) process.exit(0);
     markChatSeen(c.sid, chat[chat.length - 1].ts);
-    const fmt = (m) => `[${new Date(m.ts).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' })}] ${m.from}${m.to ? ` → ${m.to === me.name ? 'VOS' : m.to}` : ''} (${m.type}): ${m.text}`;
+    const fmt = (m) => fmtMsg(m, me.name);
     const forMe = news.filter((m) => m.to && m.to === me.name);
     const text = `📨 Sala PZ — ${news.length} mensaje(s) nuevo(s) mientras trabajás:\n`
       + news.slice(-10).map(fmt).join('\n')
@@ -376,14 +456,16 @@ if (cmd === 'join') {
   const name = rest[0];
   const what = rest.slice(1).join(' ').trim();
   if (!name) { console.error('Falta el nombre. Ej: pz join "Sinapsis" "armando la sala de chat"'); process.exit(1); }
-  heartbeat(c, { name, ...(what ? { label: what } : {}) });
+  const me = heartbeat(c, { name, ...(what ? { label: what } : {}) });
   saveLegacyLabel(c, { sessionName: name, ...(what ? { label: what } : {}) });
-  post({ from: name, type: 'join', text: what ? `me sumo — ${what}` : 'me sumo a la sala', branch: c.branch });
-  const others = liveOthersInTop(c.top, c.sid);
-  console.log(`✓ Sos "${name}"${c.branch ? ` en [${c.branch}]` : ''}${what ? ` — ${what}` : ''}`);
-  if (others.length) {
+  post({ from: name, type: 'join', text: what ? `me sumo — ${what}` : 'me sumo a la sala', branch: me.branch });
+  const others = liveOthersInTop(me.top, c.sid);
+  console.log(`✓ Sos "${name}"${me.branch ? ` en [${me.branch}]` : ''}${what ? ` — ${what}` : ''}`);
+  if (isMainFolder(me.top)) {
+    console.log(`⛔ Estás en la CARPETA PRINCIPAL: acá no se trabaja. Antes de editar, aislate:  pz isolate <tarea>`);
+  } else if (others.length) {
     console.log(`⚠️  OJO: ${others.map((o) => o.name || 'otra sesión').join(', ')} ya está(n) en ESTE mismo directorio.`);
-    console.log(`   Para no enredar commits, aislate:  pz isolate <tarea>`);
+    console.log(`   Para no enredar commits, que una de las dos siga en una sesión nueva de la app (nace en su propio worktree).`);
   }
   process.exit(0);
 }
@@ -452,28 +534,54 @@ if (cmd === 'release') {
   process.exit(0);
 }
 
+// ─── isolate ─ worktree propio off origin/<main>, para quien arrancó en la carpeta principal.
+// NUNCA usa git stash: el stash es de todo el repo (no de la sesión) y dos veces se llevó
+// trabajo ajeno (2026-08-21 "Informe del Operador"; 2026-09-08, que además se borró con el
+// worktree). --carry ahora COPIA sólo los archivos que la sesión nombra y no toca los originales.
 if (cmd === 'isolate') {
   const c = ctx({});
   if (!inPzRepo(c.cwd)) { console.error(`No estás dentro del repo configurado (${MAIN_REPO || 'sin configurar'}); no hay de qué aislarse.`); process.exit(1); }
-  const carry = rest.includes('--carry');
-  const slugArg = rest.filter((r) => r !== '--carry')[0];
+  // La app ya le da a cada sesión su propio worktree: aislarse sólo tiene sentido desde la
+  // carpeta principal, o desde una carpeta que otra sesión viva está usando a la vez.
+  const shared = liveOthersInTop(c.top, c.sid);
+  if (!isMainFolder(c.top) && !shared.length) {
+    console.log(`✓ Ya estás en tu propio worktree (${c.top}${c.branch ? `, rama ${c.branch}` : ''}): no hace falta aislarte.`);
+    console.log('  Trabajá acá y subí con PR. pz isolate es sólo para sesiones que arrancan en la carpeta principal.');
+    process.exit(0);
+  }
+  const ci = rest.indexOf('--carry');
+  const carryArgs = ci >= 0 ? rest.slice(ci + 1).flatMap((r) => r.split(',')).map((s) => s.trim()).filter(Boolean) : [];
+  if (ci >= 0 && !carryArgs.length) {
+    console.error('✗ --carry necesita la lista de TUS archivos: pz isolate <tarea> --carry src/a.js src/b.css');
+    console.error('  Se copian a tu worktree nuevo y los originales quedan donde estaban. Nunca se lleva "todo lo sucio":');
+    console.error('  en esta carpeta hay cambios que no son tuyos.');
+    process.exit(1);
+  }
+  // validar ANTES de crear nada: cada archivo tiene que existir y estar dentro de esta carpeta
+  const carry = [], bad = [];
+  for (const f of carryArgs) {
+    const abs = canon(path.resolve(c.cwd, f));
+    const rel = path.relative(c.top, abs);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) bad.push(`${f} (está fuera de ${c.top})`);
+    else if (!fs.existsSync(abs)) bad.push(`${f} (no existe acá; si lo borraste vos, borralo también en tu worktree nuevo)`);
+    else carry.push({ abs, rel });
+  }
+  if (bad.length) { console.error('✗ No aislé nada. Revisá estos archivos de --carry:\n' + bad.map((b) => '  · ' + b).join('\n')); process.exit(1); }
+  const slugArg = (ci >= 0 ? rest.slice(0, ci) : rest)[0];
   const slug = (slugArg || (c.branch && c.branch !== 'HEAD' ? c.branch.replace(/[^a-zA-Z0-9]+/g, '-') : 'tarea') + '-' + String(now()).slice(-5))
     .replace(/[^a-zA-Z0-9-]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase();
   const target = `/tmp/pz-${slug}`;
   const newBranch = `pz/${slug}`;
   if (fs.existsSync(target)) { console.error(`Ya existe ${target}. Elegí otro slug: pz isolate <slug>`); process.exit(1); }
 
-  console.log(`→ Aislando en worktree propio (off origin/${MAIN_BRANCH})…`);
+  console.log(`→ Aislando en worktree propio (off origin/${MAIN_BRANCH})… (esta carpeta no se toca)`);
   sh(`git fetch origin ${MAIN_BRANCH}`, c.cwd);
-  let stashed = false;
-  if (carry && sh('git status --porcelain', c.cwd)) {
-    const r = sh('git stash push -u -m pz-isolate', c.cwd);
-    stashed = !/No local changes/.test(r) && !!sh('git stash list', c.cwd);
-    if (stashed) console.log('  · guardé tus cambios sin commitear (stash) para mudarlos');
-  }
   const add = sh(`git worktree add -b ${newBranch} "${target}" origin/${MAIN_BRANCH}`, c.cwd);
-  if (!fs.existsSync(target)) { console.error(`No se pudo crear el worktree. ${add}`); if (stashed) sh('git stash pop', c.cwd); process.exit(1); }
-  if (stashed) { const pop = sh('git stash pop', target); console.log('  · ' + (/conflict/i.test(pop) ? 'CONFLICTO al mudar cambios — resolvé a mano en el worktree' : 'cambios mudados al worktree')); }
+  if (!fs.existsSync(target)) { console.error(`No se pudo crear el worktree. ${add}`); process.exit(1); }
+  for (const { abs, rel } of carry) {
+    try { fs.mkdirSync(path.dirname(path.join(target, rel)), { recursive: true }); fs.cpSync(abs, path.join(target, rel), { recursive: true }); console.log(`  · copié ${rel} (el original queda donde estaba)`); }
+    catch (e) { console.log(`  · ✗ no pude copiar ${rel}: ${(e && e.message) || e}`); }
+  }
   // node_modules para que servers/tools corran en el worktree
   const nm = path.join(MAIN_REPO, 'node_modules');
   if (fs.existsSync(nm) && !fs.existsSync(path.join(target, 'node_modules'))) { try { fs.symlinkSync(nm, path.join(target, 'node_modules')); console.log('  · node_modules symlinkeado'); } catch {} }
@@ -488,15 +596,16 @@ if (cmd === 'isolate') {
       try { fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.copyFileSync(src, dst); console.log(`  · copié ${path.join(sub, n)}`); } catch {}
     }
   }
-  // mover mi identidad de sesión a la nueva carpeta
-  heartbeat({ sid: c.sid, cwd: target, top: canon(target), branch: newBranch }, { name: myName(c) });
+  // mover mi identidad de sesión a la nueva carpeta (y que los hooks, que siguen
+  // reportando la carpeta de arranque, no me muden de vuelta)
+  heartbeat(c, { move: { cwd: target, top: canon(target), branch: newBranch }, isolatedTo: canon(target) });
 
   console.log(`\n✓ Worktree listo:  ${target}   [${newBranch}]`);
   console.log(`  Trabajá ahí (Edit/Write con rutas dentro de ${target}). Subí con PR a main y borralo al terminar:`);
   console.log(`    cd "${target}"`);
   console.log(`    # … editás, verificás …`);
   console.log(`    git push -u origin ${newBranch} && gh pr create --base ${MAIN_BRANCH} --fill && gh pr merge --squash --delete-branch`);
-  console.log(`    git worktree remove "${target}"`);
+  console.log(`    git worktree remove "${target}"   # si se niega por cambios, NO uses --force: mirá antes qué son`);
   process.exit(0);
 }
 
@@ -621,7 +730,9 @@ if (cmd === 'debate') {
   const decision = takeFlag(rest, '--decision', 2000);
   const abierto = takeFlag(rest, '--abierto', 2000);
   const [sub, a1, a2] = rest;
-  const live = Object.values(loadSessions()).map((s) => s.name).filter(Boolean);
+  // convocados por defecto: las sesiones vivas que se PRESENTARON (con nombre automático
+  // todavía no dijeron qué hacen; el debate se quedaría esperando su propuesta)
+  const live = Object.values(loadSessions()).filter((s) => s.name && !s.autoName).map((s) => s.name);
   const api = { me: name, live };
   (async () => {
     let r;
@@ -640,45 +751,87 @@ if (cmd === 'debate') {
   return;
 }
 
+// Latido sólo para sesiones de Claude reales dentro del repo: una terminal humana (sin
+// CLAUDE_CODE_SESSION_ID) o una sesión de otro proyecto que mira el tablero no es parte
+// de la sala y no tiene que aparecer en la lista.
+function presence(c, hook) {
+  if (String(c.sid).startsWith('env-') || !inPzRepo(c.cwd)) return readJSON(SESSIONS, {})[c.sid] || null;
+  return heartbeat(c, {}, hook);
+}
+
 if (cmd === 'whoami') {
   const c = ctx({});
   const s = readJSON(SESSIONS, {})[c.sid];
-  if (s && s.name) console.log(`${s.name}${c.branch ? ` [${c.branch}]` : ''}${s.label ? ` — ${s.label}` : ''}  ·  sid:${c.sid.slice(0, 8)}  ·  ${c.cwd}`);
+  if (s && s.name) console.log(`${s.name}${s.branch ? ` [${s.branch}]` : ''}${s.label ? ` — ${s.label}` : ''}  ·  sid:${c.sid.slice(0, 8)}  ·  ${s.cwd || c.cwd}`
+    + (s.autoName ? '\n(nombre automático — ponete uno con onda: pz join "<nombre>" "<qué hacés>")' : ''));
   else console.log(`Sin identidad. Presentate: pz join "<nombre>" "<qué hacés>"  ·  sid:${String(c.sid).slice(0, 8)}`);
+  process.exit(0);
+}
+
+// ─── chat ─ sólo la sala. Para releerla sin recortar el tablero a mano: un recorte casero
+// (`pz board | sed -n '1,12p;/Últimos mensajes/,$p'`) imprimía cada mensaje DOS veces
+// cuando el tablero era corto — ese fue el "doble" que se vio el 30-sep.
+if (cmd === 'chat') {
+  const c = ctx({});
+  const me = presence(c);
+  const n = Math.max(1, Math.min(100, parseInt(rest[0], 10) || 10));
+  const chat = readJSON(CHAT, []);
+  if (!chat.length) { console.log('💬 La sala está vacía.'); process.exit(0); }
+  console.log(`💬 Últimos ${Math.min(n, chat.length)} mensajes de la sala (del más viejo al más nuevo):`);
+  for (const m of chat.slice(-n)) console.log('  ' + fmtMsg(m, me && me.name));
+  if (me) markChatSeen(c.sid, chat[chat.length - 1].ts);
   process.exit(0);
 }
 
 if (cmd === 'board') {
   const forHook = rest.includes('--for-hook');
-  const c = ctx(forHook ? hookInput() : {});
+  const hook = forHook ? hookInput() : {};
+  const c = ctx(hook);
   if (forHook && !inPzRepo(c.cwd)) process.exit(0); // hook silencioso fuera del repo configurado
-  heartbeat(c); // presencia desde el arranque (aunque la sesión todavía no se haya "join"eado)
+  // presencia desde el arranque, con nombre automático (aunque la sesión nunca haga join)
+  const me = (forHook ? heartbeat(c, {}, hook) : presence(c)) || { top: c.top, branch: c.branch };
+  const here = me.top || c.top;           // dónde trabaja (si se aisló, su worktree nuevo)
+  const atMain = isMainFolder(here);
+  const resumed = forHook && hook.source === 'resume';
 
   let state;
   try { state = JSON.parse(sh(`curl -s http://localhost:${CFG.port}/api/state`)); } catch { state = null; }
-
+  const rowOf = (top) => state && (state.sessions || []).find((w) => canon(w.path) === top);
   const out = [];
-  // ⛔ Lo más importante: ¿hay OTRA sesión viva en MI mismo directorio? → aislate.
-  const othersHere = liveOthersInTop(c.top, c.sid);
-  const namedHere = othersHere.filter((o) => o.name);
-  if (namedHere.length) {
-    out.push('⛔ OTRA SESIÓN ESTÁ EN ESTE MISMO DIRECTORIO: ' + namedHere.map((o) => o.name).join(', '));
-    out.push('   Trabajar los dos acá enreda los commits (un `git add -A` barre el trabajo del otro).');
-    out.push('   → Aislate en tu propia copia, en UN comando:');
+  const othersHere = liveOthersInTop(here, c.sid);
+  const namesHere = othersHere.map((o) => o.name || 'otra sesión').join(', ');
+
+  // ⛔⛔ Lo primero: ¿arrancó en la carpeta principal? Ahí no trabaja nadie — tiene
+  // restos viejos preparados para commit que no son de nadie. Avisar, no tocar.
+  if (atMain) {
+    const total = sh('git status --porcelain', here).split('\n').filter(Boolean).length;
+    const staged = sh('git diff --cached --name-only', here).split('\n').filter(Boolean).length;
+    const behind = sh(`git rev-list --count HEAD..origin/${MAIN_BRANCH}`, here);
+    out.push('⛔⛔ ESTÁS EN LA CARPETA PRINCIPAL DEL REPO — ACÁ NO TRABAJA NADIE.');
+    out.push(`   ${here}`);
+    if (total) out.push(`   Tiene ${total} archivo(s) con cambios sin commitear${staged ? ` (${staged} ya preparados para commit)` : ''} que NO son tuyos: son restos viejos o de otras sesiones.`);
+    if (+behind > 0) out.push(`   Además está ${behind} commits atrás de prod: lo que ves acá puede ser código viejo.`);
+    if (othersHere.length) out.push(`   Y ahora mismo también hay otra(s) sesión(es) acá: ${namesHere}.`);
+    out.push('   No edites, no commitees y no "limpies" nada acá: nada de add, commit, checkout, reset, stash ni merge.');
+    out.push('   → Si vas a tocar código, ANTES aislate en tu propia copia, en UN comando:');
     out.push('       node "' + PZ_SCRIPT + '" isolate <tarea>');
-    out.push('     (crea un worktree off main en /tmp, te lo deja listo, y subís con PR → main)');
-    out.push('   Si te quedás acá igual: el sistema te frena `git add -A`/`commit -a` y editar archivos que otra sesión tomó.');
+    out.push('     (nace fresca de prod y sin esos restos; trabajás ahí y subís con PR)');
+    out.push('   → Si sólo vas a leer o investigar podés quedarte, pero sin escribir nada.');
     out.push('');
   } else if (othersHere.length) {
-    out.push(`ℹ️  Hay ${othersHere.length} sesión(es) recién abierta(s) (sin presentarse) en este directorio — si empiezan a trabajar acá, aislate con pz isolate.`);
+    // carpeta compartida que NO es la principal (raro: la app le da a cada sesión la suya)
+    out.push('⛔ OTRA SESIÓN ESTÁ EN ESTE MISMO DIRECTORIO: ' + namesHere);
+    out.push('   Trabajar los dos acá enreda los commits (un `git add -A` barre el trabajo del otro).');
+    out.push('   → Que una de las dos siga en una sesión nueva de la app (nace en su propio worktree).');
+    out.push('   Mientras tanto el sistema frena `git add -A`/`commit -a` y editar archivos que la otra tomó.');
     out.push('');
   }
 
   // ⏳ ¿Me hablaron a MÍ y todavía no contesté? (lo que se dirige a un agente no
   // interrumpe al humano, así que el recordatorio tiene que estar acá.)
-  const meName = myName(c);
+  const chatAll = readJSON(CHAT, []);
+  const meName = me.name || null;
   if (meName) {
-    const chatAll = readJSON(CHAT, []);
     const lastMine = [...chatAll].reverse().find((m) => m.from === meName);
     const sinceMine = lastMine ? new Date(lastMine.ts).getTime() : 0;
     const pending = chatAll.filter((m) => m.to === meName && new Date(m.ts).getTime() > sinceMine);
@@ -692,65 +845,90 @@ if (cmd === 'board') {
 
   // 🦴 ¿Este worktree es un museo? Avisar ANTES de que la sesión saque conclusiones
   // de código fósil (fetch condicional adentro; fail-open si no hay red/remoto).
-  const stale = require('./staleness').measure(c.top, { fetch: true });
+  // En la carpeta principal no: ya lo dijo arriba, y ahí NO se actualiza nada.
+  const stale = atMain ? null : require('./staleness').measure(here, { fetch: true });
   if (stale && stale.level) {
     const offline = stale.fetchFailed ? ' (no pude contactar GitHub — comparo contra la última copia local de prod)' : '';
     if (stale.level === 'red') {
       out.push(`⛔ WORKTREE-MUSEO: estás ${stale.behind} commits detrás de prod (origin/${MAIN_BRANCH}); el último commit de acá es de hace ${stale.ageDays} días${offline}.`);
       out.push('   Lo que ves en este directorio NO es el código de producción — no saques conclusiones ni edites sin actualizar.');
-      out.push('   → Trabajo nuevo: node "' + PZ_SCRIPT + '" isolate <tarea>   (nace fresco de prod)');
       out.push('   → ¿Necesitás ESTE worktree sí o sí?: git fetch origin && git merge origin/' + MAIN_BRANCH);
+      out.push('   → ¿Es trabajo nuevo? Mejor una sesión nueva de la app: nace fresca de prod.');
     } else {
-      out.push(`⚠️  Este worktree está ${stale.behind} commits / ${stale.ageDays} días detrás de prod (origin/${MAIN_BRANCH})${offline} — si vas a editar, primero actualizalo (git merge origin/${MAIN_BRANCH}) o aislate fresco (pz isolate).`);
+      out.push(`⚠️  Este worktree está ${stale.behind} commits / ${stale.ageDays} días detrás de prod (origin/${MAIN_BRANCH})${offline} — si vas a editar, primero actualizalo (git merge origin/${MAIN_BRANCH}).`);
     }
     out.push('');
   }
 
-  if (!state) { if (!forHook) console.log(out.concat('(PZ Sessions no está corriendo en :' + CFG.port + ')').join('\n')); else if (out.length) console.log(out.join('\n')); process.exit(0); }
-
-  const active = state.sessions.filter((s) => s.isActive && s.path !== c.top);
-  out.push('🎛️  PZ Sessions — otras sesiones activas ahora:');
-  if (!active.length) out.push('  (ninguna otra sesión activa)');
-  for (const s of active) {
-    const who = s.sessionName || s.name;
-    const live = (s.liveSessions && s.liveSessions.length) ? ` · 👤${s.liveSessions.length} sesión(es)` : '';
-    out.push(`  • ${who} [${s.branch || 'detached'}] — ${s.label || s.lastSubject || ''}` +
-      (s.dirtyCount ? ` · ${s.dirtyCount} sin guardar` : '') + (s.stagedCount ? ` · ${s.stagedCount} en cola p/commit` : '') + live + (s.colliding ? ' · ⚠️ colisión' : ''));
+  // 🎛️ Las SESIONES (no las carpetas): toda sesión que arrancó en el repo, con su nombre.
+  const allS = readJSON(SESSIONS, {});
+  const isLive = (s) => !!fresh(s.lastSeen, SESSION_TTL_MS);
+  const room = Object.values(allS)
+    .filter((s) => s.sessionId !== c.sid && s.inRepo !== false && fresh(s.lastSeen, SESSION_KEEP_MS))
+    .sort((a, b) => (isLive(b) - isLive(a)) || (new Date(b.lastSeen) - new Date(a.lastSeen)));
+  const ago = (iso) => { const m = Math.round((now() - new Date(iso).getTime()) / 60000); return m < 90 ? `${m} min` : `${Math.round(m / 60)} h`; };
+  out.push('🎛️  PZ Sessions — las otras sesiones de la sala:');
+  if (!room.length) out.push('  (ninguna otra sesión abierta)');
+  for (const s of room) {
+    const w = rowOf(s.top);
+    const bits = [];
+    if (isMainFolder(s.top)) bits.push('⛔ en la CARPETA PRINCIPAL');
+    if (w && w.dirtyCount) bits.push(`${w.dirtyCount} sin guardar`);
+    if (w && w.colliding) bits.push('⚠️ colisión');
+    if (!isLive(s)) bits.push(`en pausa (sin actividad hace ${ago(s.lastSeen)})`);
+    out.push(`  • ${s.name || 'sesión sin nombre'} [${s.branch || 'detached'}] — ${s.label || (s.autoName ? 'todavía no dijo qué hace' : '')}` + (bits.length ? ' · ' + bits.join(' · ') : ''));
   }
-  const sharedDirs = (state.sharedDirs || []);
-  if (sharedDirs.length) {
-    out.push('⛔ Directorios con 2+ sesiones de Claude a la vez (riesgo de commit enredado):');
-    for (const d of sharedDirs.slice(0, 6)) out.push(`  • ${d.branch || d.path} → ${d.names.join(', ')}`);
-  }
-  if (state.collisions && state.collisions.length) {
-    out.push('⚠️  Archivos que 2+ sesiones tocan a la vez:');
-    for (const cc of state.collisions.slice(0, 8)) out.push(`  • ${cc.file} → ${cc.owners.join(', ')}`);
-  }
-  const chat = (state.chat || []).slice(-6);
-  if (chat.length) {
-    out.push('💬 Últimos mensajes de la sala:');
-    for (const m of chat) {
-      const t = new Date(m.ts).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' });
-      out.push(`  [${t}] ${m.from} (${m.type}): ${m.text}`);
+  if (state) {
+    // carpetas con trabajo en curso donde no hay ninguna sesión abierta (ni en pausa)
+    const withSession = new Set(Object.values(allS).filter((s) => fresh(s.lastSeen, SESSION_KEEP_MS)).map((s) => s.top));
+    const orphan = (state.sessions || []).filter((w) => w.isActive && !withSession.has(canon(w.path)) && canon(w.path) !== here);
+    if (orphan.length) {
+      out.push('📂 Carpetas con trabajo y sin sesión abierta:');
+      for (const w of orphan) out.push(`  • ${isMainFolder(canon(w.path)) ? 'carpeta principal' : w.name} [${w.branch || 'detached'}] — ${w.lastSubject || ''}`
+        + (w.dirtyCount ? ` · ${w.dirtyCount} sin guardar` : '') + (w.stagedCount ? ` · ${w.stagedCount} en cola p/commit` : '') + (w.colliding ? ' · ⚠️ colisión' : ''));
     }
-  }
+    const sharedDirs = (state.sharedDirs || []);
+    if (sharedDirs.length) {
+      out.push('⛔ Directorios con 2+ sesiones de Claude a la vez (riesgo de commit enredado):');
+      for (const d of sharedDirs.slice(0, 6)) out.push(`  • ${d.branch || d.path} → ${d.names.join(', ')}`);
+    }
+    if (state.collisions && state.collisions.length) {
+      out.push('⚠️  Archivos que 2+ sesiones tocan a la vez:');
+      for (const cc of state.collisions.slice(0, 8)) out.push(`  • ${cc.file} → ${cc.owners.join(', ')}`);
+    }
+  } else if (!forHook) out.push(`(el tablero no está corriendo en :${CFG.port} — no puedo mostrar carpetas ni choques)`);
+
+  // 💬 La sala, cada mensaje UNA vez y con su destinatario. Al retomar una sesión, sólo
+  // lo que no vio (lo anterior ya lo tiene en su conversación).
+  const seenAt = resumed && me.chatSeen ? new Date(me.chatSeen).getTime() : null;
+  const chatShow = seenAt !== null
+    ? chatAll.filter((m) => new Date(m.ts).getTime() > seenAt && m.from !== meName).slice(-10)
+    : chatAll.slice(-6);
+  if (seenAt !== null) out.push(chatShow.length ? `💬 Mensajes nuevos de la sala desde que dejaste esta sesión (${chatShow.length}):` : '💬 Sala: nada nuevo desde que dejaste esta sesión.');
+  else if (chatShow.length) out.push('💬 Últimos mensajes de la sala:');
+  for (const m of chatShow) out.push('  ' + fmtMsg(m, meName));
+
   if (forHook) {
     out.push('');
     out.push('▶ PROTOCOLO (esta sesión, seguilo):');
     out.push('  CLI: node "' + PZ_SCRIPT + '" <cmd>');
-    out.push('  1) Si arriba dice que OTRA sesión está en tu mismo dir → `pz isolate <tarea>` (aislate antes de editar)');
-    out.push('  2) Al saber tu tarea → pz join "<nombre con onda>" "<qué hacés>"');
-    out.push('  3) Tomá lo que vas a tocar → pz claim <archivos o carpetas>   (el sistema frena a quien intente pisarlos)');
-    out.push('  4) ¿Duda que sólo el usuario puede resolver? → pz ask --wait "<pregunta>" [--timeout 300] (espera la respuesta del chat; ajustá el timeout del Bash tool acorde)');
+    // aislarse SÓLO desde la carpeta principal: la app ya le da a cada sesión su worktree
+    if (atMain) out.push('  0) Estás en la CARPETA PRINCIPAL (ver arriba) → antes de editar: pz isolate <tarea>. Acá no se commitea nada.');
+    else if (othersHere.length) out.push('  0) Compartís carpeta con otra sesión (ver arriba) → coordiná por la sala antes de editar.');
+    else out.push('  0) Ya estás en tu propio worktree: trabajá acá, no hace falta aislarte.');
+    if (me.autoName) out.push(`  1) Ya te anoté en la sala como «${me.name}». Al saber tu tarea → pz join "<nombre con onda>" "<qué hacés>"`);
+    else out.push(`  1) Estás en la sala como «${me.name}». Si cambió tu tarea → pz join "${me.name}" "<qué hacés ahora>"`);
+    out.push('  2) Tomá lo que vas a tocar → pz claim <archivos o carpetas>   (el sistema frena a quien intente pisarlos)');
+    out.push('  3) ¿Duda que sólo el usuario puede resolver? → pz ask --wait "<pregunta>" [--timeout 300] (espera la respuesta del chat; ajustá el timeout del Bash tool acorde)');
     out.push('     ¿Es para OTRO agente, no para el usuario? → agregá --to "<agente>" y no le suena el teléfono a nadie');
-    out.push('  4b) ¿Decisión de fondo sin número que la resuelva (arquitectura, prioridades)? → pz debate abrir "<tema>" --criterio "<cómo decidimos>"');
+    out.push('  3b) ¿Decisión de fondo sin número que la resuelva (arquitectura, prioridades)? → pz debate abrir "<tema>" --criterio "<cómo decidimos>"');
     out.push('      Cada uno propone A CIEGAS (pz debate proponer <id>), se destapan juntas, se objeta CON evidencia y se cierra con decisión escrita.');
-    out.push('  5) Al terminar → pz say done "<resultado / PR #>"');
-    out.push('  Los mensajes nuevos de la sala te van a llegar solos mientras trabajás (hook inbox) — no hace falta pollear.');
+    out.push('  4) Al terminar → pz say done "<resultado / PR #>"');
+    out.push('  Los mensajes nuevos de la sala te llegan solos mientras trabajás (hook inbox). Para releerla: pz chat [N] (no recortes el tablero a mano).');
     out.push('  Tablero + chat (para el usuario): http://localhost:' + CFG.port);
   }
   // lo que el board ya mostró cuenta como leído (que el inbox no lo repita)
-  if (state.chat && state.chat.length) markChatSeen(c.sid, state.chat[state.chat.length - 1].ts);
+  if (chatAll.length && me.sessionId) markChatSeen(c.sid, chatAll[chatAll.length - 1].ts);
   console.log(out.join('\n'));
   process.exit(0);
 }
@@ -772,8 +950,11 @@ console.log(`pz — Sala de Sesiones${REPO_NAME ? ' · ' + REPO_NAME : ' (sin re
   pz debate ver [<id>]  ·  destapar <id>  ·  cerrar <id> --decision "…" [--abierto "<desacuerdo>"]
                                         el cierre escribe la decisión en el vault; si algo queda
                                         abierto, ESO sí se le escala al humano
-  pz isolate [<slug>] [--carry]         crear tu worktree propio off main y mudarte (lleva .env y node_modules)
-  pz board                              ver otras sesiones + chat
+  pz isolate [<slug>] [--carry <tus archivos>]
+                                        SÓLO si arrancaste en la carpeta principal: worktree propio off main
+                                        (lleva .env y node_modules; --carry COPIA los archivos que nombres)
+  pz board                              ver las otras sesiones + carpetas + chat
+  pz chat [N]                           sólo los últimos N mensajes de la sala (10 por defecto)
   pz bitacora [--date D] [--weekly] [--json]   generar bitácora diaria o semanal (2 capas) → Obsidian + tablero
   pz whoami
   pz install [<ruta-al-repo>] [--owner "Nombre"] [--dry-run]   configurar repo (+ pregunta tu nombre) y cablear los hooks

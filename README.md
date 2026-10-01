@@ -30,13 +30,21 @@ the same working tree**. One `git add -A` then sweeps up everyone else's work.
 
 1. **Identity per session, not per folder.** The unit is the Claude session
    (`CLAUDE_CODE_SESSION_ID`), so two sessions in the same directory are
-   distinguished and counted as the danger they are. Each session heartbeats and
-   is considered live for 30 minutes.
+   distinguished and counted as the danger they are. Every session that starts in
+   the repo (or any of its worktrees) is registered by the `SessionStart` hook with
+   a default name — the session title the app gives it (Claude Code writes it to
+   the transcript), or its branch until it has one. `pz join` replaces it with a
+   name of your choosing. Each session heartbeats; it is **live** for 30 minutes
+   and then shown as **paused** (name kept, no alarms) for up to 24 hours.
 
-2. **Isolation by default — `pz isolate`.** If you start where another live
-   session already is, the board tells you and hands you one command to move to
-   your own throwaway worktree off `origin/main` (carrying uncommitted changes if
-   you want). You work there, ship via PR, delete it. No mixing.
+2. **One worktree per session — `pz isolate` only from the main folder.** Apps
+   like Claude Desktop already start each session in its own worktree, so the
+   board doesn't ask those sessions to isolate. Nobody works in the main checkout:
+   a session that starts there gets a loud warning first thing, and one command to
+   move to its own throwaway worktree off `origin/main`. `pz isolate` never uses
+   `git stash` (the stash belongs to the whole repo and used to carry other
+   sessions' uncommitted work away); `--carry <files>` **copies** only the files
+   you name and leaves the originals in place.
 
 3. **Real brakes, not warnings (PreToolUse hooks).** Before each Edit/Write/Bash:
    - Editing a file another live session **claimed** → blocked (exit 2) with an
@@ -73,7 +81,7 @@ The hooks it wires:
 
 | Event | Runs | Purpose |
 |-------|------|---------|
-| `SessionStart` | `pz board --for-hook` | Inject board state; shout if another session is in your dir |
+| `SessionStart` | `pz board --for-hook` | Register the session (default name); inject board state; shout if it started in the main folder or another session is in its dir |
 | `PreToolUse` (Edit/Write/MultiEdit/NotebookEdit/Bash) | `pz guard` | The brakes (layer 3) |
 | `PostToolUse` (all) + `UserPromptSubmit` | `pz inbox` | Deliver new chat messages to the session while it works |
 | `SessionEnd` | `pz leave` | Leave the room, release claims |
@@ -92,8 +100,10 @@ pz claim <files|folders...>                   # take them (a folder = everything
 pz check <files...>                           # free or taken? (exit 2 if taken) — for agents without hooks
 pz release [files...]                         # let them go (all if unspecified)
 pz debate abrir|proponer|objetar|ver|cerrar   # decision threads — see below
-pz isolate [<slug>] [--carry]                 # your own worktree off main; carries .env + node_modules
-pz board                                      # sessions + shared dirs + collisions + chat
+pz isolate [<slug>] [--carry <files...>]      # only from the main folder: your own worktree off main
+                                              # (brings .env + node_modules; --carry COPIES the files you name)
+pz board                                      # sessions (live + paused) + folders + collisions + chat
+pz chat [N]                                   # just the last N chat messages (default 10)
 pz whoami
 pz install [<repo>] [--dry-run]               # configure repo + wire hooks
 pz uninstall [--dry-run]                      # remove the hooks
@@ -201,9 +211,9 @@ and claims.
 
 The manual workflow is:
 
-1. Run `board` before editing. If another live session is in the same working
-   directory, run `isolate <task-slug>` first and continue in the worktree it
-   creates.
+1. Run `board` before editing. If you are in the repo's main folder, run
+   `isolate <task-slug>` first and continue in the worktree it creates. If another
+   live session shares your worktree, start the task in a fresh worktree instead.
 2. Run `join`, then `claim` every file or directory before changing it. Without
    the hooks, claims are an honor-system lock: never edit something owned by
    another session.
