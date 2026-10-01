@@ -593,7 +593,13 @@ if (cmd === 'bitacora') {
   console.log(`📖 Generando bitácora ${weekly ? 'SEMANAL' : (date ? `de ${date}` : 'de hoy')}… (la IA redacta, puede tardar un par de minutos)`);
   const r = run(false);
   if (r.empty) { console.log(`Sin actividad ${weekly ? 'esa semana' : 'ese día'} — no se generó bitácora.`); process.exit(0); }
-  if (r.error) { console.error('✗ ' + r.error); process.exit(1); }
+  if (r.error) {
+    console.error('✗ ' + r.error);
+    // El nocturno corre bajo launchd y nadie lee ese log: que el fallo aparezca
+    // en la sala (y por lo tanto en el hook de arranque de la próxima sesión).
+    post({ from: 'Bitácora 📖', type: 'warn', text: `No se pudo generar la bitácora ${weekly ? 'SEMANAL' : (date || 'de hoy')}: ${r.error}` });
+    process.exit(1);
+  }
   console.log(weekly
     ? `✓ Bitácora semanal ${r.label}: ${r.prCount} PRs, ${r.sessionCount} sesiones → ${r.path}`
     : `✓ Bitácora ${r.date}: ${r.prCount} PRs, ${r.sessionCount} sesiones → ${r.path}`);

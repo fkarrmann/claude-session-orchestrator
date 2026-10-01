@@ -424,7 +424,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.url.startsWith('/api/') && !sameOrigin(req)) return json(403, { ok: false, error: 'forbidden (cross-origin)' });
 
-  if (req.url === '/api/state') return json(200, { ...cache, owner: ownerName, chat: readChat() });
+  if (req.url === '/api/state') return json(200, { ...cache, owner: ownerName, chat: readChat(), bitacora: BITACORA.readStatus() });
   if (req.url === '/api/chat') return json(200, { chat: readChat() });
   if (req.url === '/api/config' && req.method === 'POST') {
     let p = {}; try { p = JSON.parse(await body(req)); } catch {}
@@ -450,7 +450,7 @@ const server = http.createServer(async (req, res) => {
       .filter((f) => (w ? /^Semana-\d{4}-\d{2}-\d{2}\.md$/ : /^\d{4}-\d{2}-\d{2}\.md$/).test(f))
       .map((f) => f.replace(/^Semana-/, '').slice(0, 10)).sort(); } catch { return []; } };
     const fileFor = (w, d) => path.join(BIT_DIR, (w ? 'Semana-' : '') + d + '.md');
-    if (u.pathname === '/api/bitacora/list') return json(200, { dates: listDates(week).reverse(), generating: bitGenerating });
+    if (u.pathname === '/api/bitacora/list') return json(200, { dates: listDates(week).reverse(), generating: bitGenerating, status: BITACORA.readStatus() });
     if (u.pathname === '/api/bitacora/generate' && req.method === 'POST') {
       let p = {}; try { p = JSON.parse(await body(req)); } catch {}
       if (bitGenerating) return json(200, { ok: true, already: true });
@@ -468,7 +468,7 @@ const server = http.createServer(async (req, res) => {
       const date = u.searchParams.get('date') || (dates.length ? dates[dates.length - 1] : null);
       if (!date) return json(200, { date: null, md: null, dates, generating: bitGenerating });
       let md = null; try { md = fs.readFileSync(fileFor(week, date), 'utf8'); } catch {}
-      return json(200, { date, md, dates, generating: bitGenerating });
+      return json(200, { date, md, dates, generating: bitGenerating, status: BITACORA.readStatus() });
     }
   }
 
@@ -861,6 +861,10 @@ function renderState(d){
     +(c.collisions>0?'<span class="stat bad"><b>'+c.collisions+'</b> colisiones</span>':'')
     +(c.cleanable>0?'<span class="stat warn"><b>'+c.cleanable+'</b> limpiables</span>':'');
   document.getElementById('updated').textContent='actualizado '+new Date(d.generatedAt).toLocaleTimeString('es-AR');
+  // Punto rojo en el 📖 si la última bitácora falló — visible sin abrir el modal.
+  const bb=document.getElementById('bitBtn'),bst=d.bitacora;
+  bb.classList.toggle('alert',!!(bst&&bst.ok===false));
+  bb.title=(bst&&bst.ok===false)?'Bitácora CAÍDA — '+(bst.error||'la última corrida falló'):'Bitácora — el diario de a bordo del proyecto';
   // franja roja full-width: lo más peligroso, imposible de no ver
   const dn=document.getElementById('danger');
   if(d.sharedDirs&&d.sharedDirs.length){

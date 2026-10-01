@@ -11,6 +11,7 @@ claims.json
 chat.json
 registry.json
 debates.json
+bitacora-status.json
 server.log
 
 # Backups + escrituras atómicas (tmp + rename) + backup de settings del installer.

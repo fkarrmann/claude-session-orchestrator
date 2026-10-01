@@ -30,6 +30,11 @@ const CHAT = path.join(__dirname, 'chat.json');
 const OUT_DIR = process.env.PZ_BITACORA_DIR ||
   path.join(os.homedir(), 'Documents', 'PicnicZero-Docs', 'Bitácora');
 
+// Última corrida (ok / vacía / fallada). Vive al lado del código, NO en el vault:
+// es estado operativo, no contenido. El tablero lo lee para avisar cuando el
+// generador está mudo — antes fallaba en silencio dentro de un log que nadie abre.
+const STATUS = path.join(__dirname, 'bitacora-status.json');
+
 const readJSON = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return d; } };
 const sh = (c, cwd) => { try { return execSync(c, { cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 20000 }).trim(); } catch { return ''; } };
 const pad = (n) => String(n).padStart(2, '0');
@@ -218,16 +223,48 @@ function worktreeHealthSection() {
   return lines.join('\n');
 }
 
+// El CLI muere con "Command failed: claude -p …" y se traga el motivo real en
+// stderr. Eso hizo que un login vencido pasara 18 noches invisible (jul-2026):
+// el log repetía "Command failed" y nadie sabía que había que re-loguearse.
+// Acá traducimos el crudo a algo accionable ANTES de que llegue al log.
+const AUTH_RE = /OAuth.*(expired|invalid)|authentication_error|Failed to authenticate|Invalid API key|\b401\b/i;
+
+function explainClaudeFailure(e) {
+  const raw = [e && e.stderr, e && e.stdout, e && e.message]
+    .map((x) => (x ? String(x) : '')).join('\n');
+  if (AUTH_RE.test(raw))
+    return 'el login de Claude en esta máquina está VENCIDO. Abrí una Terminal, corré `claude` y hacé `/login`. Hasta entonces no se genera ninguna bitácora.';
+  if (/ENOENT|command not found/i.test(raw))
+    return 'no se encontró el comando `claude` en el PATH (¿launchd con PATH pelado?).';
+  if ((e && e.signal === 'SIGTERM') || /ETIMEDOUT/i.test(raw))
+    return 'Claude tardó más de 7 minutos redactando y se cortó por timeout.';
+  const tail = raw.split('\n').map((l) => l.trim()).filter(Boolean).slice(-4).join(' · ');
+  return (tail || String((e && e.message) || e)).slice(0, 600);
+}
+
 // claude headless: prompt por stdin, markdown por stdout. Sin permisos de tools.
 function callClaude(prompt) {
+  let md;
   try {
-    const md = execSync('claude -p --output-format text', {
+    md = execSync('claude -p --output-format text', {
       input: prompt, encoding: 'utf8', timeout: 420000,
       stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024,
     }).trim();
-    return md ? { md } : { error: 'claude devolvió vacío' };
-  } catch (e) { return { error: 'claude headless falló: ' + (e.message || e) }; }
+  } catch (e) { return { error: 'claude headless falló: ' + explainClaudeFailure(e) }; }
+
+  if (!md) return { error: 'claude devolvió vacío' };
+  // Red de seguridad: si algún día el CLI escupe el error de auth por stdout y
+  // sale con código 0, NO queremos escribir una bitácora que diga "401".
+  if (md.length < 800 && AUTH_RE.test(md))
+    return { error: 'claude headless falló: ' + explainClaudeFailure({ stdout: md }) };
+  return { md };
 }
+
+// ─── estado de la última corrida ───────────────────────────────────────────────
+function writeStatus(s) {
+  try { fs.writeFileSync(STATUS, JSON.stringify({ ts: new Date().toISOString(), ...s }, null, 2)); } catch {}
+}
+function readStatus() { return readJSON(STATUS, null); }
 
 // ─── generación DIARIA ─────────────────────────────────────────────────────────
 function generate(opts = {}) {
@@ -236,15 +273,22 @@ function generate(opts = {}) {
   const data = collect(win);
 
   if (opts.jsonOnly) return { data };
-  if (!data.sessions.length && !data.prs.length) return { empty: true, date: dateStr, data };
+  if (!data.sessions.length && !data.prs.length) {
+    writeStatus({ kind: 'day', date: dateStr, ok: true, empty: true });
+    return { empty: true, date: dateStr, data };
+  }
 
   const r = callClaude(buildPrompt(data));
-  if (r.error) return { error: r.error, data };
+  if (r.error) {
+    writeStatus({ kind: 'day', date: dateStr, ok: false, error: r.error });
+    return { error: r.error, data };
+  }
 
   fs.mkdirSync(OUT_DIR, { recursive: true });
   const outPath = path.join(OUT_DIR, `${dateStr}.md`);
   fs.writeFileSync(outPath, linkifyPRs(r.md, data.prs) + worktreeHealthSection() + '\n');
   const backup = gitBackup(`Bitácora ${dateStr}`);
+  writeStatus({ kind: 'day', date: dateStr, ok: true, prCount: data.prs.length, sessionCount: data.sessions.length });
   return { path: outPath, date: dateStr, prCount: data.prs.length, sessionCount: data.sessions.length, backup, data };
 }
 
@@ -310,19 +354,26 @@ function generateWeekly(opts = {}) {
   const data = collectWeek(win);
 
   if (opts.jsonOnly) return { data };
-  if (!data.sessions.length && !data.prs.length) return { empty: true, weekEnd: win.weekEnd, label: win.label, data };
+  if (!data.sessions.length && !data.prs.length) {
+    writeStatus({ kind: 'week', date: win.weekEnd, label: win.label, ok: true, empty: true });
+    return { empty: true, weekEnd: win.weekEnd, label: win.label, data };
+  }
 
   const r = callClaude(buildWeeklyPrompt(data));
-  if (r.error) return { error: r.error, data };
+  if (r.error) {
+    writeStatus({ kind: 'week', date: win.weekEnd, label: win.label, ok: false, error: r.error });
+    return { error: r.error, data };
+  }
 
   fs.mkdirSync(OUT_DIR, { recursive: true });
   const outPath = path.join(OUT_DIR, `Semana-${win.weekEnd}.md`);
   fs.writeFileSync(outPath, linkifyPRs(r.md, data.prs) + '\n');
   const backup = gitBackup(`Bitácora semanal ${win.label}`);
+  writeStatus({ kind: 'week', date: win.weekEnd, label: win.label, ok: true, prCount: data.prs.length, sessionCount: data.sessions.length });
   return { path: outPath, weekEnd: win.weekEnd, label: win.label, prCount: data.prs.length, sessionCount: data.sessions.length, backup, data };
 }
 
-module.exports = { collect, collectWeek, generate, generateWeekly, buildPrompt, buildWeeklyPrompt, linkifyPRs, gitBackup, workdayWindow, weekWindowContaining, currentWorkday, worktreeHealthSection, OUT_DIR };
+module.exports = { collect, collectWeek, generate, generateWeekly, buildPrompt, buildWeeklyPrompt, linkifyPRs, gitBackup, workdayWindow, weekWindowContaining, currentWorkday, worktreeHealthSection, readStatus, OUT_DIR };
 
 // directo: `node bitacora.js [--date D] [--json] [--weekly] [--last-week]`
 if (require.main === module) {
