@@ -771,6 +771,17 @@ if (cmd === 'chat') {
   process.exit(0);
 }
 
+// Umbral (la app de Clara): los pedidos para Claudio pendientes o tomados. Rápido y callado si falla.
+const UMBRAL_CLI = require('path').join(require('os').homedir(), 'Documents', 'Claude Code', 'umbral', 'scripts', 'claudio.js');
+function umbralPedidos() {
+  try {
+    const llave = fs.readFileSync(require('path').join(require('os').homedir(), '.claude', 'secrets', 'umbral_admin'), 'utf8').trim();
+    const base = (process.env.UMBRAL_URL || 'https://umbral-ldy3.onrender.com').replace(/\/+$/, '');
+    const r = require('child_process').execFileSync('curl', ['-s', '-m', '4', '-H', `Authorization: Bearer ${llave}`, `${base}/api/claudio/pedidos`], { encoding: 'utf8', timeout: 6000 });
+    return (JSON.parse(r).pedidos || []).slice(0, 8);
+  } catch { return []; }
+}
+
 if (cmd === 'board') {
   const forHook = rest.includes('--for-hook');
   const hook = forHook ? hookInput() : {};
@@ -895,6 +906,17 @@ if (cmd === 'board') {
   if (seenAt !== null) out.push(chatShow.length ? `💬 Mensajes nuevos de la sala desde que dejaste esta sesión (${chatShow.length}):` : '💬 Sala: nada nuevo desde que dejaste esta sesión.');
   else if (chatShow.length) out.push('💬 Últimos mensajes de la sala:');
   for (const m of chatShow) out.push('  ' + fmtMsg(m, meName));
+
+  // 🚪 Umbral: lo que Fede le pidió a Claudio por medio de Clara (su secretaria). Si Umbral no contesta, no se dice nada.
+  if (forHook && !resumed) {
+    const umbral = umbralPedidos();
+    if (umbral.length) {
+      out.push('');
+      out.push(`🚪 Umbral — Fede te pidió (por Clara) ${umbral.length === 1 ? 'una cosa' : umbral.length + ' cosas'}:`);
+      for (const p of umbral) out.push(`  • #${p.id} [${p.espacio}${p.estado === 'tomado' ? ', TOMADO' : ''}] ${p.pedido.replace(/\s+/g, ' ').slice(0, 220)}`);
+      out.push('  Ver el contexto, tomarlo o cerrarlo: node "' + UMBRAL_CLI + '" ayuda   (al cerrarlo, Clara se entera y se lo cuenta a Fede)');
+    }
+  }
 
   if (forHook) {
     out.push('');
