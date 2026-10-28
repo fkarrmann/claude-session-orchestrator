@@ -416,7 +416,7 @@ if (cmd === 'ask') {
   const text = rest.filter((r, i) => r !== '--wait' && r !== '--timeout' && !(ti >= 0 && i === ti + 1))[0];
   if (!text) { console.error('Falta la pregunta. Ej: pz ask --wait "¿priorizo A o B?"'); process.exit(1); }
   post({ from: name, type: 'ask', text, branch: c.branch, to });
-  const dest = to ? `para ${to}` : `para ${CFG.owner || 'el humano'} (le llega al teléfono)`;
+  const dest = to ? `para ${to}` : `para ${CFG.owner || 'el humano'} (le llega como tarjeta en Umbral, o por Telegram si Umbral no anda)`;
   if (!wait) { console.log(`❓ [${name}] pregunta posteada ${dest}.`); process.exit(0); }
   console.log(`❓ Pregunta posteada ${dest}. Espero respuesta hasta ${timeoutS}s… (con --timeout N esperás más; ojo el timeout del Bash tool)`);
   const since = Date.now();

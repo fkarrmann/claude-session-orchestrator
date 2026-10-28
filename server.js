@@ -262,7 +262,7 @@ function checkNotify() {
     const ownerAt = ownerName ? new RegExp('@' + escRe(ownerName) + '\\b', 'i') : null;       // @owner (con arroba)
     const ownerStart = ownerName ? new RegExp('^' + escRe(ownerName), 'i') : null;            // sus propios mensajes
     // no hacer eco de lo que entró por Telegram (firmado "X (Telegram)") ni de los propios mensajes del owner
-    const notMine = (m) => !/\(telegram\)\s*$/i.test(m.from || '') && !(ownerStart && ownerStart.test(m.from || ''));
+    const notMine = (m) => !/\((telegram|umbral)\)\s*$/i.test(m.from || '') && !(ownerStart && ownerStart.test(m.from || ''));
     // Un mensaje dirigido a OTRO agente es coordinación entre sesiones: no es asunto
     // del humano. Sin esto, cada "¿tomás vos este archivo?" entre agentes le sonaba el
     // teléfono. Dirigido al owner (o sin destinatario) sí lo es.
@@ -286,14 +286,26 @@ function checkNotify() {
         // notificación nativa solo en macOS; en otros SO degrada en silencio (queda el tablero + Telegram)
         if (process.platform === 'darwin') sh(`osascript -e 'display notification "${body}" with title "PZ Sessions" subtitle "${sub}" sound name "Glass"'`);
     }
-    // Telegram: uno por mensaje (las preguntas llevan sus propios botones)
+    // Lo que es para el owner va a Umbral como tarjeta (umbral.js); si Umbral no la toma, por Telegram (uno por
+    // mensaje: las preguntas llevan sus propios botones).
     for (const x of fresh.filter(isForTg).slice(-3)) {
-        console.log(`[tg→owner] ${x.type} de ${x.from}: ${String(x.text).slice(0, 80)}`);
+      UMBRAL.preguntar(x).then((enUmbral) => {
+        if (enUmbral) return;
+        console.log(`[${UMBRAL.activo() ? 'umbral✗→tg' : 'tg→owner'}] ${x.type} de ${x.from}: ${String(x.text).slice(0, 80)}`);
         tgNotify(x);
+      }).catch(() => tgNotify(x));
+    }
+    // El owner contestó por el tablero o por Telegram: esas tarjetas salen de Umbral.
+    for (const x of fresh.filter((m) => ownerStart && ownerStart.test(m.from || '') && !/\(umbral\)\s*$/i.test(m.from || ''))) {
+      UMBRAL.alContestarAfuera(x).catch(() => {});
     }
   } catch {}
 }
 setInterval(checkNotify, 3000);
+
+// ─── Umbral — la sala le llega a Clara (umbral.js) ───────────────────────────
+const UMBRAL = require('./umbral')({ readChat, postMessage, owner: () => ownerName });
+UMBRAL.arrancar();
 
 // ─── Telegram — bot dedicado de alertas (opcional) ───────────────────────────
 // Asks/menciones de la sala llegan por DM: las preguntas con botones ✅/❌ y opción

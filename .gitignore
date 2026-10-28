@@ -12,6 +12,7 @@ chat.json
 registry.json
 debates.json
 bitacora-status.json
+umbral-state.json
 server.log
 
 # Backups + escrituras atómicas (tmp + rename) + backup de settings del installer.
