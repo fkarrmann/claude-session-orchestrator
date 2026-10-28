@@ -11,24 +11,24 @@
  *     lo toma como respuesta (autor que no es una sesión). Recién después se marca entregada en Umbral.
  *   • Si contesta por otro lado (tablero, Telegram), la tarjeta se retira de Umbral: no contesta dos veces.
  *
- * Llave: ~/.claude/secrets/umbral_admin (la misma del gancho de pedidos de pz.js). Sin llave, o con PZ_NO_UMBRAL=1
- * (instancia de prueba), no hace nada y las preguntas siguen yendo por Telegram.
+ * Se configura en pz.config.json → umbral: { url, llave } (la llave es la ruta a un archivo; config.js). Sin eso, o con
+ * PZ_NO_UMBRAL=1 (instancia de prueba), no hace nada y las preguntas siguen yendo por Telegram.
  */
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { readJSON, writeJSON } = require('./state');
 
-const URL = (process.env.UMBRAL_URL || 'https://umbral-ldy3.onrender.com').replace(/\/+$/, '');
-const LLAVE_ARCHIVO = path.join(os.homedir(), '.claude', 'secrets', 'umbral_admin');
+const CFG = require('./config');
+
+const URL = CFG.umbral.url;
 const STATE = path.join(__dirname, 'umbral-state.json');
 const CADA_MS = 30_000;
 const POR_VEZ = 200;
 const DESDE_EL_PRINCIPIO_MS = 24 * 3600_000;  // la primera vez, sólo lo del último día
 
 function llave() {
-  if (process.env.PZ_NO_UMBRAL) return null;
-  try { return fs.readFileSync(LLAVE_ARCHIVO, 'utf8').trim() || null; } catch { return null; }
+  if (CFG.umbral.off || !URL || !CFG.umbral.llave) return null;
+  try { return fs.readFileSync(CFG.umbral.llave, 'utf8').trim() || null; } catch { return null; }
 }
 
 async function api(metodo, ruta, cuerpo) {

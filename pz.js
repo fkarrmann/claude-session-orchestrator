@@ -775,8 +775,9 @@ if (cmd === 'chat') {
 const UMBRAL_CLI = require('path').join(require('os').homedir(), 'Documents', 'Claude Code', 'umbral', 'scripts', 'claudio.js');
 function umbralPedidos() {
   try {
-    const llave = fs.readFileSync(require('path').join(require('os').homedir(), '.claude', 'secrets', 'umbral_admin'), 'utf8').trim();
-    const base = (process.env.UMBRAL_URL || 'https://umbral-ldy3.onrender.com').replace(/\/+$/, '');
+    if (CFG.umbral.off || !CFG.umbral.url || !CFG.umbral.llave) return [];
+    const llave = fs.readFileSync(CFG.umbral.llave, 'utf8').trim();
+    const base = CFG.umbral.url;
     const r = require('child_process').execFileSync('curl', ['-s', '-m', '4', '-H', `Authorization: Bearer ${llave}`, `${base}/api/claudio/pedidos`], { encoding: 'utf8', timeout: 6000 });
     return (JSON.parse(r).pedidos || []).slice(0, 8);
   } catch { return []; }

@@ -44,6 +44,13 @@ module.exports = {
     model: process.env.PZ_LOCAL_LLM_MODEL || (file.localLlm && file.localLlm.model) || '',   // vacío = lo descubre de /v1/models
     nombre: process.env.PZ_LOCAL_LLM_NAME || (file.localLlm && file.localLlm.nombre) || 'Qwen local 🧩',
   },
+  // Umbral (opcional): una app que recibe la sala y le muestra al owner sus preguntas como tarjetas (umbral.js).
+  // Sin url o sin llave, apagado: las preguntas van por Telegram. La llave es la RUTA a un archivo, nunca el secreto.
+  umbral: {
+    url: (process.env.PZ_UMBRAL_URL || (file.umbral && file.umbral.url) || '').replace(/\/+$/, ''),
+    llave: expandHome((file.umbral && file.umbral.llave) || ''),
+    off: !!process.env.PZ_NO_UMBRAL,
+  },
   dir: DIR,
   pzScript: path.join(DIR, 'pz.js'),
   serverScript: path.join(DIR, 'server.js'),
